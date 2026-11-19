@@ -85,14 +85,33 @@ a default:
 | `--satdump-keep AGE` | `30d`, `3mo`, `1y` | Delete SatDump data older than this. |
 | `--satdump-max-size SIZE` | `200G`, `1.5T` | Keep the SatDump folder under this size. |
 | `--satdump-disk-cap N%` | `90%` | When the disk is fuller than this, delete the oldest SatDump data. |
+| `--satdump-protect FOLDER` | | Never delete from this run folder. May be repeated. |
+| `--satdump-include FOLDER` | | Also treat this folder as a GOES HRIT run, if you named it yourself. May be repeated. |
 
     python3 ~/goesview/goesview.py /path/to/satdump-output --satdump-keep 3mo --satdump-disk-cap 90% --prune-dry-run
 
-How the SatDump options behave:
+What the SatDump options can and cannot reach:
 
-- They remove whole timestamp folders under `IMAGES/` and `L2/`, and single
-  files in `EMWIN/` and `IMAGES/NWS/`, always oldest first. The previews and
-  colour frames made from deleted data go with them.
+- **Only GOES HRIT run folders.** That means folders directly under the one
+  you point GOESview at that carry SatDump's own name for such a run
+  (`..._goes_hrit_...`), old runs as well as the current one. Old runs are
+  included on purpose: SatDump starts a new run folder each time it restarts,
+  so the oldest data usually sits in an old run.
+- **Nothing else in that folder is ever touched**: runs from other satellites
+  or pipelines, baseband recordings, folders you made yourself, loose files.
+  A folder you named yourself is left alone even if it holds GOES images,
+  unless you add it with `--satdump-include`.
+- **Inside a run, only recognised SatDump products go**: timestamp folders
+  under `IMAGES/` and `L2/`, EMWIN files and NWS charts. A timestamp folder
+  that contains anything SatDump did not write is left whole.
+- **You are told what is covered.** The startup log lists the run folders the
+  limits apply to and the items they never touch, and the Live page shows the
+  same under Storage.
+
+How they behave:
+
+- Deletion is always oldest first. The previews and colour frames made from
+  deleted data go with it.
 - Limits combine: `--satdump-keep 3mo --satdump-disk-cap 90%` keeps three
   months unless the disk gets tight, then trims further.
 - Data from the last 3 hours is never deleted, whatever the limits say. If a

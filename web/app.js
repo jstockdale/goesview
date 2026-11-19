@@ -348,7 +348,15 @@ function LiveView(root) {
           h('i', { style: 'background:var(--warn)' }), 'filed under an earlier scan'));
     }
     if (s.storage) {
-      const { free, total, cache, satdump, dry, last } = s.storage, gb = n => (n / 2 ** 30).toFixed(n < 100 * 2 ** 30 ? 1 : 0);
+      const { free, total, cache, satdump, dry, last, scope } = s.storage, gb = n => (n / 2 ** 30).toFixed(n < 100 * 2 ** 30 ? 1 : 0);
+      const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+      // Exactly which folders SatDump retention may delete from, and what it leaves alone.
+      const reach = satdump && scope && h('div', { class: 'reach' },
+        `Applies to ${plural(scope.runs.length, 'GOES HRIT run folder')}:`,
+        scope.runs.map(name => h('div', { class: 'run', text: name })),
+        scope.protected.length ? h('div', {}, `Protected: ${scope.protected.join(', ')}`) : null,
+        scope.others.length ? h('div', { title: scope.others.join('\n') }, `Never touches the ${plural(scope.others.length, 'other item')} in this folder.`) : null,
+        scope.skipped ? h('div', {}, `Leaves ${plural(scope.skipped, 'unrecognised item')} inside the runs alone.`) : null);
       const used = 1 - free / total, trial = dry ? ' (dry run)' : '';
       const sweep = info => info && h('div', {}, `${info.dry ? 'Would remove' : 'Last removed'} ${info.what} · `, agoEl(info.t));
       // Two kinds of files, shown apart: our own cache, and what SatDump received.
@@ -360,7 +368,7 @@ function LiveView(root) {
           h('b', { text: 'GOESview cache' }),
           h('span', {}, cache ? cache + trial : 'kept forever', sweep(last && last.cache)),
           h('b', { class: satdump ? 'deletes' : '', text: 'SatDump data' }),
-          h('span', {}, satdump ? `${satdump}; older data is deleted${trial}` : 'never deleted', sweep(last && last.satdump))));
+          h('span', {}, satdump ? `${satdump}; older data is deleted${trial}` : 'never deleted', reach, sweep(last && last.satdump))));
     }
     if (s.satdump) {
       const keys = Object.keys(s.satdump);

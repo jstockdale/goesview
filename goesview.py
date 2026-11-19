@@ -26,6 +26,7 @@ Derived files go to --cache. The SatDump folder is only ever read, unless a
 import argparse
 import bisect
 import calendar
+import collections
 import gzip
 import hashlib
 import json
@@ -247,6 +248,8 @@ class Catalog:
         self.pending_maps = {}
         self.slots = {}  # (section, group) -> {slot name: (dir relative to root, set of file names)}
         self.dirs = {self.root: DirState()}
+        self.ids = {}                                # item id -> item, for feed cursors
+        self.recent = collections.deque(maxlen=400)  # latest live arrivals, replayed to reconnecting tabs
         self.subscribers = set()
         self.listeners = []
         self.tick = 0
@@ -369,19 +372,27 @@ class Catalog:
         item.id, item.path, item.kind, item.type = self.last_id, vpath, spec.kind, kind
         item.time, item.recv, item.size, item.note, item.name = when, recv, size, note, spec.name
         item.map = self.pending_maps.pop(vpath, None)
-        self.items.append(item)
+        # Feeds run in arrival order. Almost everything is appended; a colour frame
+        # registered late (after a restart, or built for an old slot) slots in by time.
+        arrival = lambda i: (i.recv, i.id)
+        for feed in (self.items, kind.arrivals):
+            if not feed or arrival(feed[-1]) <= arrival(item):
+                feed.append(item)
+            else:
+                bisect.insort(feed, item, key=arrival)
         self.by_path[vpath] = item
-        kind.arrivals.append(item)
+        self.ids[item.id] = item
         bisect.insort(kind.items, item, key=lambda i: (i.time, i.id))
         if live:
+            self.recent.append(item)
             self.publish("item", item.as_dict(), item.id)
         for listener in self.listeners:
             listener(item, live)
         return item
 
-    def add_derived(self, vpath, spec, when, recv, size, note):
+    def add_derived(self, vpath, spec, when, recv, size, note, live):
         with self.lock:
-            return self._commit(vpath, spec, when, recv, size, note, live=True)
+            return self._commit(vpath, spec, when, recv, size, note, live=live)
 
     # -- live events
 
@@ -417,8 +428,9 @@ class Catalog:
         with self.lock:
             source = self.types[type_id].arrivals if type_id in self.types else ([] if type_id else self.items)
             hi = len(source)
-            if before:
-                hi = bisect.bisect_left(source, before, key=lambda i: i.id)
+            anchor = self.ids.get(before) if before else None
+            if anchor:  # continue from just before the last item the page was given
+                hi = bisect.bisect_left(source, (anchor.recv, anchor.id), key=lambda i: (i.recv, i.id))
             query = query.lower() if query else None
             out = []
             for i in range(hi - 1, -1, -1):
@@ -440,8 +452,7 @@ class Catalog:
 
     def since(self, last_id, limit=300):
         with self.lock:
-            start = bisect.bisect_right(self.items, last_id, key=lambda i: i.id)
-            return [i.as_dict() for i in self.items[max(start, len(self.items) - limit):]]
+            return [i.as_dict() for i in self.recent if i.id > last_id][-limit:]
 
     def forget(self, dead_dirs, dead_files):
         """Drop everything in the given timestamp folders (paths relative to the
@@ -451,6 +462,9 @@ class Catalog:
         with self.lock:
             dead = {i.id for i in self.items if gone(i.path)}
             self.items = [i for i in self.items if i.id not in dead]
+            self.recent = collections.deque((i for i in self.recent if i.id not in dead), maxlen=self.recent.maxlen)
+            for item_id in dead:
+                self.ids.pop(item_id, None)
             for kind in list(self.types.values()):
                 kind.items = [i for i in kind.items if i.id not in dead]
                 kind.arrivals = [i for i in kind.arrivals if i.id not in dead]
@@ -659,7 +673,13 @@ class Colourist(threading.Thread):
                 note = f"band {band} from the {odd.name[11:16].replace('-', ':')} scan"
             st = os.stat(out)
             spec = Spec("imagery", group, f"False Color · {self.lut_name}", "image", 0.0, when)
-            self.catalog.add_derived(vpath, spec, when, st.st_mtime, st.st_size, note)
+            # A colour frame "arrives" when the later of its two bands did, wherever and
+            # whenever it was actually built, so it sits beside them in the feeds.
+            bands = [self.catalog.by_path.get(f"s/{slots[s.name][0]}/{s.bands[b]}")
+                     for s, b in ((vis, fc.VISIBLE), (ir, fc.INFRARED))]
+            arrived = max((item.recv for item in bands if item), default=st.st_mtime)
+            # Only announce it to open pages as a new arrival if it really is one.
+            self.catalog.add_derived(vpath, spec, when, arrived, st.st_size, note, live=now - arrived < 900)
             if built:
                 log(f"false colour: {group} {target.name}" + (f" ({note})" if note else ""))
                 return True
@@ -716,6 +736,53 @@ def poll_satdump(url, state):
 
 PRUNE_ANCHORS = ("IMAGES", "L2", "EMWIN")
 PRUNE_FLOOR = 3 * 3600  # nothing newer than this is ever deleted, whatever the limits say
+RUN_NAME_RE = re.compile(r"goes[_-]?hrit", re.I)  # SatDump names a run folder after its pipeline
+GOES_DIR_RE = re.compile(r"^GOES-\d+$")
+
+
+def goes_runs(root, protect=(), include=()):
+    """Sort what is under `root` into (runs, protected, others).
+
+    `runs` are the folders SatDump retention may delete from. A folder directly under
+    the root qualifies only if it holds IMAGES/, L2/ or EMWIN/ and carries SatDump's
+    own name for a GOES HRIT run ("..._goes_hrit_..."), or the user named it with
+    --satdump-include. Everything else under the root (other satellites, other
+    pipelines, folders you made yourself, loose files) lands in `others` and is never
+    touched. `protected` are GOES runs the user excluded by name.
+
+    If the root is itself one run folder, that folder is the only run; there a
+    differently named folder also counts when it holds IMAGES/GOES-nn, since the
+    user pointed straight at it.
+    """
+    def has_data(path):
+        return any(os.path.isdir(os.path.join(path, anchor)) for anchor in PRUNE_ANCHORS)
+
+    def holds_goes(path):
+        try:
+            return any(GOES_DIR_RE.match(e.name) and e.is_dir(follow_symlinks=False)
+                       for e in os.scandir(os.path.join(path, "IMAGES")))
+        except OSError:
+            return False
+
+    if has_data(root) and (RUN_NAME_RE.search(os.path.basename(root)) or holds_goes(root)):
+        return [root], [], []
+    runs, protected, others = [], [], []
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError:
+        return runs, protected, others
+    for entry in entries:
+        named = RUN_NAME_RE.search(entry.name) or entry.name in include
+        if named and not entry.is_symlink() and entry.is_dir(follow_symlinks=False) and has_data(entry.path):
+            (protected if entry.name in protect else runs).append(entry.path)
+        elif not entry.name.startswith("."):
+            others.append(entry.name)
+    return runs, protected, others
+
+
+def satdump_product(name):
+    """Is this a file SatDump writes into a timestamp folder?"""
+    return name == "product.cbor" or bool(BAND_RE.match(name) or COMPOSITE_RE.match(name))
 
 
 def parse_age(text):
@@ -794,10 +861,14 @@ class Pruner(threading.Thread):
     """Deletes the oldest files to stay within the cache limits and, separately and
     only if asked, the SatDump limits. Always oldest first."""
 
-    def __init__(self, app, cache, satdump, every, dry_run):
+    def __init__(self, app, cache, satdump, every, dry_run, protect=(), include=()):
         super().__init__(daemon=True, name="pruner")
         self.app, self.catalog = app, app.catalog
         self.cache, self.satdump = cache, satdump
+        self.protect, self.include = set(protect), set(include)
+        self.scope = None  # what SatDump retention applies to, for the log and the Live page
+        if satdump:
+            self.survey()
         self.every, self.dry_run = every, dry_run
         self.last = {"cache": None, "satdump": None}
         self.cache_swept = 0
@@ -813,6 +884,22 @@ class Pruner(threading.Thread):
                     traceback.print_exc()
             time.sleep(self.every)
 
+    @staticmethod
+    def size(unit):
+        """A unit's size, measured the first time it is needed and then remembered.
+
+        Units are [time, size or None, path, is_folder]. Measuring everything up front
+        means a stat of every file on every sweep; in practice only the few oldest
+        units ever need it. Anything measured here is older than 3 hours, so it is
+        long since closed and its size is final.
+        """
+        if unit[1] is None:
+            try:
+                unit[1] = tree_size(unit[2]) if unit[3] else os.lstat(unit[2]).st_size
+            except OSError:
+                unit[1] = 0
+        return unit[1]
+
     def choose(self, units, limits, now, disk_path, label):
         """How many of `units` (oldest first) must go to satisfy `limits`."""
         protected = now - PRUNE_FLOOR
@@ -820,22 +907,24 @@ class Pruner(threading.Thread):
         if limits.keep:
             while cut < len(units) and units[cut][0] < now - limits.keep:
                 cut += 1
-        if limits.max_size:
-            total = sum(unit[1] for unit in units[cut:])
+        if limits.max_size:  # a total needs every unit measured: the one slow rule
+            total = sum(self.size(unit) for unit in units[cut:])
             while total > limits.max_size and cut < len(units) and units[cut][0] < protected:
-                total -= units[cut][1]
+                total -= self.size(units[cut])
                 cut += 1
             if total > limits.max_size:
                 log(f"prune {label}: still {human(total)} after removing everything older than 3 hours")
         if limits.disk_cap:
             disk = shutil.disk_usage(disk_path)
-            excess = (disk.total - disk.free) - limits.disk_cap * disk.total - sum(unit[1] for unit in units[:cut])
-            while excess > 0 and cut < len(units) and units[cut][0] < protected:
-                excess -= units[cut][1]
-                cut += 1
-            if excess > 0:
-                log(f"prune {label}: the disk is still {human(excess)} over its {limits.disk_cap:.0%} cap; "
-                    f"these limits cannot free more")
+            excess = (disk.total - disk.free) - limits.disk_cap * disk.total
+            if excess > 0:  # over the cap: measure only what is about to go, oldest first
+                excess -= sum(self.size(unit) for unit in units[:cut])
+                while excess > 0 and cut < len(units) and units[cut][0] < protected:
+                    excess -= self.size(units[cut])
+                    cut += 1
+                if excess > 0:
+                    log(f"prune {label}: the disk is still {human(excess)} over its {limits.disk_cap:.0%} cap; "
+                        f"these limits cannot free more")
         return cut
 
     def record(self, key, label, summary):
@@ -851,7 +940,7 @@ class Pruner(threading.Thread):
             when = stamp(os.path.basename(base), "%Y-%m-%d_%H-%M-%S") if SLOT_RE.match(os.path.basename(base)) else None
             if when is not None:
                 dirs[:] = []
-                found.append((when, tree_size(base), base, True))
+                found.append([when, None, base, True])
         for base, _, names in os.walk(self.app.previews.folder):
             for name in names:
                 if name.endswith(".jpg"):
@@ -859,7 +948,7 @@ class Pruner(threading.Thread):
                         st = os.lstat(os.path.join(base, name))
                     except OSError:
                         continue
-                    found.append((st.st_mtime, st.st_size, os.path.join(base, name), False))
+                    found.append([st.st_mtime, st.st_size, os.path.join(base, name), False])
         found.sort(key=lambda unit: unit[0])
         return found
 
@@ -881,7 +970,7 @@ class Pruner(threading.Thread):
         doomed = units[:cut]
         frames = [unit for unit in doomed if unit[3]]
         self.record("cache", "GOESview cache", f"{count(len(frames), 'colour frame folder')} and "
-                    f"{count(cut - len(frames), 'preview')}, {human(sum(unit[1] for unit in doomed))}")
+                    f"{count(cut - len(frames), 'preview')}, {human(sum(self.size(unit) for unit in doomed))}")
         if self.dry_run:
             return
         dead, stale = set(), []
@@ -914,48 +1003,79 @@ class Pruner(threading.Thread):
 
     # -- SatDump's received data: only with an explicit --satdump-* limit
 
-    def satdump_units(self, sizes):
-        """Everything SatDump wrote that may be deleted, as (time, size, path, is_folder)."""
-        found = []
+    def survey(self):
+        """Work out which folders SatDump retention applies to, and say so when that changes."""
+        runs, protected, others = goes_runs(self.catalog.root, self.protect, self.include)
+        name = lambda path: os.path.basename(path) or path
+        scope = {"runs": [name(r) for r in runs], "protected": [name(r) for r in protected],
+                 "others": others, "skipped": (self.scope or {}).get("skipped", 0)}
+        if not self.scope or any(scope[k] != self.scope[k] for k in ("runs", "protected", "others")):
+            log(f"retention, SatDump data applies to {count(len(runs), 'GOES HRIT run folder')}: "
+                + (", ".join(scope["runs"]) or "none found"))
+            if protected:
+                log("retention, SatDump data: protected by --satdump-protect: " + ", ".join(scope["protected"]))
+            if others:
+                log(f"retention, SatDump data: never touches the {count(len(others), 'other item')} under the root: "
+                    + ", ".join(others[:8]) + (" ..." if len(others) > 8 else ""))
+        self.scope = scope
+        return runs
 
-        def walk(folder, depth, anchored):
+    def satdump_units(self):
+        """What may be deleted, as [time, size or None, path, is_folder], oldest first.
+
+        Only inside GOES HRIT run folders, only under IMAGES/, L2/ and EMWIN/, and only
+        things recognised as SatDump products: a timestamp folder holding nothing but
+        SatDump's files, or a flat file with an EMWIN or NWS chart name. Anything else
+        found along the way is left where it is.
+        """
+        found, skipped = [], 0
+
+        def walk(folder, depth):
+            nonlocal skipped
             try:
                 entries = list(os.scandir(folder))
             except OSError:
                 return
             for entry in entries:
-                if entry.name.startswith(".") or entry.is_symlink() or entry.path == self.catalog.derived_root:
+                if entry.is_symlink() or entry.name.startswith("."):
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    if anchored and SLOT_RE.match(entry.name):
-                        when = stamp(entry.name, "%Y-%m-%d_%H-%M-%S")
-                        if when is not None:
-                            found.append((when, tree_size(entry.path) if sizes else 0, entry.path, True))
-                    elif depth < 8 and (anchored or depth == 0 or entry.name in PRUNE_ANCHORS):
-                        walk(entry.path, depth + 1, anchored or entry.name in PRUNE_ANCHORS)
-                elif anchored:
-                    m = EMWIN_RE.match(entry.name)
-                    when = stamp(m.group(3), "%Y%m%d%H%M%S") if m else None
-                    if when is None and (m := NWS_RE.match(entry.name)):
-                        when = stamp(m.group(1), "%Y%m%d%H%M%S")
-                    size = 0
-                    if when is None or sizes:
-                        try:
-                            st = entry.stat(follow_symlinks=False)
-                        except OSError:
-                            continue
-                        when, size = st.st_mtime if when is None else when, st.st_size
-                    found.append((when, size, entry.path, False))
+                    when = stamp(entry.name, "%Y-%m-%d_%H-%M-%S") if SLOT_RE.match(entry.name) else None
+                    if when is None:
+                        if depth < 6:
+                            walk(entry.path, depth + 1)
+                        continue
+                    try:
+                        inside = list(os.scandir(entry.path))
+                    except OSError:
+                        continue
+                    if all(e.is_file(follow_symlinks=False) and satdump_product(e.name) for e in inside):
+                        found.append([when, None, entry.path, True])
+                    else:
+                        skipped += 1  # something in there is not SatDump's: leave the whole folder
+                    continue
+                m = EMWIN_RE.match(entry.name)
+                when = stamp(m.group(3), "%Y%m%d%H%M%S") if m else None
+                if when is None and (m := NWS_RE.match(entry.name)):
+                    when = stamp(m.group(1), "%Y%m%d%H%M%S")
+                if when is None:
+                    skipped += 1  # not a name SatDump gives its files
+                    continue
+                found.append([when, None, entry.path, False])
 
-        walk(self.catalog.root, 0, os.path.basename(self.catalog.root) in PRUNE_ANCHORS)
+        for run in self.survey():
+            for anchor in PRUNE_ANCHORS:
+                walk(os.path.join(run, anchor), 0)
+        if skipped != self.scope["skipped"]:
+            log(f"retention, SatDump data: leaving {count(skipped, 'unrecognised item')} inside the run folders alone")
+        self.scope["skipped"] = skipped
         found.sort(key=lambda unit: unit[0])
         return found
 
     def sweep_satdump(self):
         if not self.satdump:
             return  # the default: SatDump's files are never touched
-        sizes = bool(self.satdump.max_size or self.satdump.disk_cap)
-        units = self.satdump_units(sizes)
+        units = self.satdump_units()
         if not units:
             return
         # Ages count back from the newest data received, capped at the wall clock.
@@ -995,7 +1115,7 @@ class Pruner(threading.Thread):
         self.record("satdump", "SatDump data",
                     f"{count(len(dead_dirs), 'folder')} and {count(len(dead_files), 'file')} dated up to "
                     f"{time.strftime('%Y-%m-%d %H:%MZ', time.gmtime(doomed[-1][0]))}"
-                    + (f", {human(sum(unit[1] for unit in doomed))}" if sizes else ""))
+                    + (f", {human(sum(unit[1] for unit in doomed))}" if all(u[1] is not None for u in doomed) else ""))
         if self.dry_run:
             return
 
@@ -1206,6 +1326,7 @@ class App:
         storage = {"free": disk.free, "total": disk.total,
                    "cache": pruner.cache.describe() if pruner and pruner.cache else None,
                    "satdump": pruner.satdump.describe() if pruner and pruner.satdump else None,
+                   "scope": pruner.scope if pruner else None,
                    "dry": bool(pruner and pruner.dry_run),
                    "last": pruner.last if pruner else {}}
         return {**self.catalog.stats(), "storage": storage, **self.extra}
@@ -1247,13 +1368,21 @@ def main():
                       help="when the disk is fuller than this, delete the oldest cached files: 90%%")
     theirs = ap.add_argument_group(
         "SatDump's received data",
-        "These PERMANENTLY DELETE files SatDump wrote, oldest first: timestamp folders under IMAGES/ and L2/, "
-        "and files in EMWIN/ and IMAGES/NWS/. None has a default: unless you give one, GOESview never deletes "
-        "anything SatDump received. Data newer than 3 hours is never deleted. Try with --prune-dry-run first.")
+        "These PERMANENTLY DELETE files SatDump wrote, oldest first. None has a default: unless you give one, "
+        "GOESview never deletes anything SatDump received. They apply to every GOES HRIT run folder under the "
+        "root, meaning folders carrying SatDump's own '..._goes_hrit_...' name, old runs included, and to nothing "
+        "else: other satellites, other pipelines and your own files and folders are never touched. Inside a run "
+        "only recognised SatDump products go: timestamp folders under IMAGES/ and L2/, EMWIN files and NWS "
+        "charts. Data newer than 3 hours is never deleted. The log and the Live page list exactly which folders "
+        "are covered. Try with --prune-dry-run first.")
     theirs.add_argument("--satdump-keep", type=parse_age, metavar="AGE", help="delete SatDump data older than this: 30d, 3mo, 1y")
     theirs.add_argument("--satdump-max-size", type=parse_size, metavar="SIZE", help="keep the SatDump folder under this size: 200G, 1.5T")
     theirs.add_argument("--satdump-disk-cap", type=parse_cap, metavar="N%",
                         help="when the disk is fuller than this, delete the oldest SatDump data: 90%%")
+    theirs.add_argument("--satdump-protect", action="append", default=[], metavar="FOLDER",
+                        help="never delete from this run folder (its name under the root); may be repeated")
+    theirs.add_argument("--satdump-include", action="append", default=[], metavar="FOLDER",
+                        help="also treat this folder as a GOES HRIT run, if you named it yourself; may be repeated")
     ap.add_argument("--prune-every", type=float, default=10, metavar="MIN", help="minutes between retention sweeps (default: %(default)s)")
     ap.add_argument("--prune-dry-run", action="store_true", help="log what retention would delete, delete nothing")
     for old in ("--keep", "--max-size", "--min-free"):  # early names that did not say whose files they deleted
@@ -1306,7 +1435,8 @@ def main():
     else:
         log("retention, SatDump data: never deleted (no --satdump-* option given)")
     if cache_limits or satdump_limits:
-        app.pruner = Pruner(app, cache_limits, satdump_limits, args.prune_every * 60, args.prune_dry_run)
+        app.pruner = Pruner(app, cache_limits, satdump_limits, args.prune_every * 60, args.prune_dry_run,
+                            args.satdump_protect, args.satdump_include)
         app.pruner.start()
 
     if args.satdump_api:
