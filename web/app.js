@@ -122,20 +122,24 @@ const popup = (() => {
       body.append(pre);
     }
     dlg.className = `popup ${isImage ? 'image' : 'text'}`;
+    // Three fixed columns, so the buttons stay put while stepping: nav | what (clipped) | actions.
     dlg.replaceChildren(
       h('header', {},
-        h('div', { class: 'what' },
-          isImage ? h('b', { text: type ? type.label : '' })
-            : [h('span', { class: 'code' + (WARN_CODES.has(code) ? ' warn' : ''), text: code }), h('b', { text: item.nm || '' })],
-          h('span', { class: 'grp', text: isImage ? (type ? type.grp : '') : (desc || '') }),
-          h('span', { class: 'dim', text: utc(item.t, true) }), agoEl(item.r),
-          item.n && h('span', { class: 'note', text: item.n })),
-        h('div', { class: 'acts' },
+        h('div', { class: 'nav' },
           many && h('button', { title: 'Previous (←)', text: '◀', onclick: () => step(-1) }),
-          many && h('span', { class: 'dim', text: `${at + 1} / ${list.length}` }),
-          many && h('button', { title: 'Next (→)', text: '▶', onclick: () => step(1) }),
-          h('a', { class: 'btn go', href: isImage ? typeHref(item.ty, item.t) : textHref(item.ty, item.id),
-            text: isImage ? 'Open in timeline →' : `See it among ${code || 'similar'} bulletins →` }),
+          many && h('span', { class: 'count', text: `${at + 1} / ${list.length}` }),
+          many && h('button', { title: 'Next (→)', text: '▶', onclick: () => step(1) })),
+        h('div', { class: 'what' },
+          h('div', { class: 'line' },
+            isImage ? h('b', { text: type ? type.label : '' })
+              : [h('span', { class: 'code' + (WARN_CODES.has(code) ? ' warn' : ''), text: code }), h('b', { text: item.nm || '' })],
+            h('span', { class: 'grp', text: isImage ? (type ? type.grp : '') : (desc || '') })),
+          h('div', { class: 'line sub' },
+            h('span', { text: utc(item.t, true) }), agoEl(item.r),
+            item.n && h('span', { class: 'note', text: item.n }))),
+        h('div', { class: 'acts' },
+          h('a', { class: 'btn go', href: isImage ? typeHref(item.ty, item.t) : textHref(item.ty, item.id) },
+            isImage ? 'Open in timeline →' : ['See it among ', h('span', { class: 'code', text: code || '···' }), ' bulletins →']),
           h('a', { class: 'btn', href: file(item.p), target: '_blank', rel: 'noopener', text: isImage ? 'Full resolution ↗' : 'Raw ↗' }),
           h('button', { title: 'Close (Esc)', text: '✕', onclick: () => dlg.close() }))),
       body);
