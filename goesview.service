@@ -1,0 +1,46 @@
+# goesview: live viewer for SatDump GOES HRIT output.
+#
+# Before installing, change the three values marked EDIT:
+#   User=        the account SatDump runs as (it must be able to read the output)
+#   ExecStart=   where goesview is installed, and the folder to serve
+#
+# Serve the folder that CONTAINS SatDump's timestamped run folder, not the run
+# folder itself. SatDump makes a new run folder every time it restarts, and
+# goesview picks up every run it finds underneath.
+#
+# To cap disk use, add retention limits to the end of ExecStart, for example
+#   --keep 14d --min-free 10%
+# These delete the oldest received data. Try them with --prune-dry-run first
+# and read the log. See README.md.
+#
+# Install:
+#   sudo cp goesview.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now goesview
+# Logs:
+#   journalctl -u goesview -f
+
+[Unit]
+Description=goesview: live viewer for SatDump GOES HRIT output
+After=network.target local-fs.target
+
+[Service]
+# EDIT
+User=CHANGE_ME
+# EDIT both paths; keep the quotes if a path has spaces
+ExecStart=/usr/bin/python3 "/home/CHANGE_ME/goesview/goesview.py" "/home/CHANGE_ME/satdump-output" --port 1234
+Restart=on-failure
+RestartSec=5
+
+# Stay out of SatDump's way: decoding is real time, previews are not.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# It writes to ~/.cache/goesview, and to the SatDump folder only if retention is on.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

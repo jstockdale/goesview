@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+dist/
+
+# Colour tables are not redistributed here; see "Colour tables" in README.md.
+luts/*.png
