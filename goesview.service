@@ -32,6 +32,11 @@ ExecStart=/usr/bin/python3 "/home/CHANGE_ME/goesview/goesview.py" "/home/CHANGE_
 Restart=on-failure
 RestartSec=5
 
+# If the folder is on a drive that is mounted after boot (for example under
+# /media/<user>/, which appears at desktop login), wait for it instead of failing:
+#ExecStartPre=/bin/sh -c 'until [ -d "/home/CHANGE_ME/satdump-output" ]; do sleep 5; done'
+#TimeoutStartSec=infinity
+
 # Stay out of SatDump's way: decoding is real time, previews are not.
 Nice=10
 IOSchedulingClass=best-effort
