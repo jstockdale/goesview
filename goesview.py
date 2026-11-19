@@ -15,12 +15,13 @@ What it does:
     colour table, pairing band 2 and band 13 across timestamp folders when the
     feed splits them (see pair_false_color.py)
 
-  * optionally deletes the oldest received data to stay within an age, size or
-    free-space limit (--keep, --max-size, --min-free; off by default)
+  * keeps its own cache in check (--cache-* options; 30 days by default)
+  * never deletes anything SatDump received, unless you explicitly give a
+    --satdump-* retention option
 
 Standard library only for serving; Pillow for previews, numpy for false colour.
-Derived files go to --cache. The SatDump folder is only read, unless a retention
-limit is given.
+Derived files go to --cache. The SatDump folder is only ever read, unless a
+--satdump-* option is given.
 """
 import argparse
 import bisect
@@ -702,7 +703,16 @@ def poll_satdump(url, state):
         time.sleep(2)
 
 
-# -------------------------------------------------------------------- pruning
+# ------------------------------------------------------------------ retention
+#
+# Two kinds of files, kept strictly apart:
+#
+#   cache     GOESview's own previews and false-colour frames. They are rebuilt from
+#             SatDump's data on demand, so deleting them loses nothing. Governed by
+#             the --cache-* options.
+#   satdump   The data SatDump received. Once deleted it is gone. Only the --satdump-*
+#             options ever touch it, and none of them has a default: unless one is
+#             given, GOESview never deletes a single file SatDump wrote.
 
 PRUNE_ANCHORS = ("IMAGES", "L2", "EMWIN")
 PRUNE_FLOOR = 3 * 3600  # nothing newer than this is ever deleted, whatever the limits say
@@ -717,6 +727,10 @@ def parse_age(text):
     return float(m.group(1)) * units[m.group(2) or ""]
 
 
+def parse_age_or_off(text):
+    return None if text.strip().lower() in ("off", "none", "never", "0") else parse_age(text)
+
+
 def parse_size(text):
     """'500M', '200G', '1.5T' to bytes."""
     m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kmgt])i?b?\s*", text.lower())
@@ -725,12 +739,12 @@ def parse_size(text):
     return int(float(m.group(1)) * 1024 ** " kmgt".index(m.group(2)))
 
 
-def parse_free(text):
-    """A size, or a share of the disk such as '10%'."""
-    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*%\s*", text)
-    if m and 0 < float(m.group(1)) < 100:
-        return ("share", float(m.group(1)) / 100)
-    return ("bytes", parse_size(text))
+def parse_cap(text):
+    """'90%' to 0.9: how full the disk may get."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*%?\s*", text)
+    if not m or not 1 <= float(m.group(1)) <= 99:
+        raise argparse.ArgumentTypeError(f"{text!r}: give how full the disk may get, such as 90%")
+    return float(m.group(1)) / 100
 
 
 def count(n, noun):
@@ -745,21 +759,14 @@ def human(size):
     return f"{size:.1f} TB"
 
 
-class Pruner(threading.Thread):
-    """Deletes the oldest received data to honour --keep, --max-size and --min-free.
+class Limits:
+    """One set of limits: an age, a total size, and how full the disk may get."""
 
-    The units it removes are whole timestamp folders under IMAGES/ and L2/, and
-    single files in the flat folders (EMWIN/, IMAGES/NWS/), always oldest first.
-    Previews and false-colour frames made from deleted data go with it.
-    """
+    def __init__(self, keep=None, max_size=None, disk_cap=None):
+        self.keep, self.max_size, self.disk_cap = keep, max_size, disk_cap
 
-    def __init__(self, app, keep, max_size, min_free, every, dry_run):
-        super().__init__(daemon=True, name="pruner")
-        self.app, self.catalog = app, app.catalog
-        self.keep, self.max_size, self.min_free = keep, max_size, min_free
-        self.every, self.dry_run = every, dry_run
-        self.sizes = bool(max_size or min_free)
-        self.last = None
+    def __bool__(self):
+        return bool(self.keep or self.max_size or self.disk_cap)
 
     def describe(self):
         parts = []
@@ -767,32 +774,149 @@ class Pruner(threading.Thread):
             parts.append(f"the last {count(round(self.keep / 86400, 2), 'day')}")
         if self.max_size:
             parts.append(f"at most {human(self.max_size)}")
-        if self.min_free:
-            kind, value = self.min_free
-            parts.append(f"at least {value:.0%} free" if kind == "share" else f"at least {human(value)} free")
-        return "keeping " + ", ".join(parts) + (" (dry run)" if self.dry_run else "")
+        if self.disk_cap:
+            parts.append(f"disk under {self.disk_cap:.0%} full")
+        return "keeping " + ", ".join(parts)
+
+
+def tree_size(folder):
+    total = 0
+    for base, _, names in os.walk(folder):
+        for name in names:
+            try:
+                total += os.lstat(os.path.join(base, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+class Pruner(threading.Thread):
+    """Deletes the oldest files to stay within the cache limits and, separately and
+    only if asked, the SatDump limits. Always oldest first."""
+
+    def __init__(self, app, cache, satdump, every, dry_run):
+        super().__init__(daemon=True, name="pruner")
+        self.app, self.catalog = app, app.catalog
+        self.cache, self.satdump = cache, satdump
+        self.every, self.dry_run = every, dry_run
+        self.last = {"cache": None, "satdump": None}
+        self.cache_swept = 0
+        self.cache_root = os.path.dirname(self.catalog.derived_root)
+        os.makedirs(self.cache_root, exist_ok=True)
 
     def run(self):
         while True:
-            try:
-                self.sweep()
-            except Exception:
-                traceback.print_exc()
+            for sweep in (self.sweep_cache, self.sweep_satdump):
+                try:
+                    sweep()
+                except Exception:
+                    traceback.print_exc()
             time.sleep(self.every)
 
-    def units(self):
-        """Everything deletable as (time, size, path, is_folder)."""
-        found = []
+    def choose(self, units, limits, now, disk_path, label):
+        """How many of `units` (oldest first) must go to satisfy `limits`."""
+        protected = now - PRUNE_FLOOR
+        cut = 0  # units[:cut] go
+        if limits.keep:
+            while cut < len(units) and units[cut][0] < now - limits.keep:
+                cut += 1
+        if limits.max_size:
+            total = sum(unit[1] for unit in units[cut:])
+            while total > limits.max_size and cut < len(units) and units[cut][0] < protected:
+                total -= units[cut][1]
+                cut += 1
+            if total > limits.max_size:
+                log(f"prune {label}: still {human(total)} after removing everything older than 3 hours")
+        if limits.disk_cap:
+            disk = shutil.disk_usage(disk_path)
+            excess = (disk.total - disk.free) - limits.disk_cap * disk.total - sum(unit[1] for unit in units[:cut])
+            while excess > 0 and cut < len(units) and units[cut][0] < protected:
+                excess -= units[cut][1]
+                cut += 1
+            if excess > 0:
+                log(f"prune {label}: the disk is still {human(excess)} over its {limits.disk_cap:.0%} cap; "
+                    f"these limits cannot free more")
+        return cut
 
-        def tree_size(folder):
-            total = 0
-            for base, _, names in os.walk(folder):
-                for name in names:
+    def record(self, key, label, summary):
+        self.last[key] = {"t": int(time.time()), "what": summary, "dry": self.dry_run}
+        log(f"prune {label}{' (dry run): would remove' if self.dry_run else ': removed'} {summary}")
+
+    # -- GOESview's own files
+
+    def cache_units(self):
+        """(time, size, path, is_frame_folder): colour-frame folders by scan time, previews by when made."""
+        found = []
+        for base, dirs, names in os.walk(self.catalog.derived_root):
+            when = stamp(os.path.basename(base), "%Y-%m-%d_%H-%M-%S") if SLOT_RE.match(os.path.basename(base)) else None
+            if when is not None:
+                dirs[:] = []
+                found.append((when, tree_size(base), base, True))
+        for base, _, names in os.walk(self.app.previews.folder):
+            for name in names:
+                if name.endswith(".jpg"):
                     try:
-                        total += os.lstat(os.path.join(base, name)).st_size
+                        st = os.lstat(os.path.join(base, name))
                     except OSError:
-                        pass
-            return total
+                        continue
+                    found.append((st.st_mtime, st.st_size, os.path.join(base, name), False))
+        found.sort(key=lambda unit: unit[0])
+        return found
+
+    def sweep_cache(self):
+        if not self.cache:
+            return
+        now = time.time()
+        over = False
+        if self.cache.disk_cap:
+            disk = shutil.disk_usage(self.cache_root)
+            over = disk.total - disk.free > self.cache.disk_cap * disk.total
+        if now - self.cache_swept < 3600 and not over:
+            return  # walking the whole cache is slow; hourly is plenty unless the disk is over its cap
+        self.cache_swept = now
+        units = self.cache_units()
+        cut = self.choose(units, self.cache, now, self.cache_root, "GOESview cache") if units else 0
+        if not cut:
+            return
+        doomed = units[:cut]
+        frames = [unit for unit in doomed if unit[3]]
+        self.record("cache", "GOESview cache", f"{count(len(frames), 'colour frame folder')} and "
+                    f"{count(cut - len(frames), 'preview')}, {human(sum(unit[1] for unit in doomed))}")
+        if self.dry_run:
+            return
+        dead, stale = set(), []
+        for _, _, path, _ in frames:
+            rel = os.path.relpath(path, self.catalog.derived_root).replace(os.sep, "/")
+            try:
+                for entry in os.scandir(path):
+                    vpath = f"d/{rel}/{entry.name}"
+                    dead.add(vpath)
+                    stale.extend(self.app.previews.cached(vpath, entry.stat()))
+            except OSError:
+                pass
+        if self.app.colourist:
+            self.app.colourist.failed.update(dead)  # pruned on purpose: do not rebuild them
+        self.catalog.forget(set(), dead)
+        for _, _, path, is_frames in doomed:
+            if not os.path.realpath(path).startswith(self.cache_root + os.sep):
+                continue  # never touch anything outside the cache folder
+            if is_frames:
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                stale.append(path)
+        for path in stale:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if dead:
+            self.catalog.publish("pruned", {"cutoff": int(frames[-1][0]), "what": "cache"})
+
+    # -- SatDump's received data: only with an explicit --satdump-* limit
+
+    def satdump_units(self, sizes):
+        """Everything SatDump wrote that may be deleted, as (time, size, path, is_folder)."""
+        found = []
 
         def walk(folder, depth, anchored):
             try:
@@ -806,7 +930,7 @@ class Pruner(threading.Thread):
                     if anchored and SLOT_RE.match(entry.name):
                         when = stamp(entry.name, "%Y-%m-%d_%H-%M-%S")
                         if when is not None:
-                            found.append((when, tree_size(entry.path) if self.sizes else 0, entry.path, True))
+                            found.append((when, tree_size(entry.path) if sizes else 0, entry.path, True))
                     elif depth < 8 and (anchored or depth == 0 or entry.name in PRUNE_ANCHORS):
                         walk(entry.path, depth + 1, anchored or entry.name in PRUNE_ANCHORS)
                 elif anchored:
@@ -815,7 +939,7 @@ class Pruner(threading.Thread):
                     if when is None and (m := NWS_RE.match(entry.name)):
                         when = stamp(m.group(1), "%Y%m%d%H%M%S")
                     size = 0
-                    if when is None or self.sizes:
+                    if when is None or sizes:
                         try:
                             st = entry.stat(follow_symlinks=False)
                         except OSError:
@@ -827,43 +951,21 @@ class Pruner(threading.Thread):
         found.sort(key=lambda unit: unit[0])
         return found
 
-    def sweep(self):
-        units = self.units()
+    def sweep_satdump(self):
+        if not self.satdump:
+            return  # the default: SatDump's files are never touched
+        sizes = bool(self.satdump.max_size or self.satdump.disk_cap)
+        units = self.satdump_units(sizes)
         if not units:
             return
         # Ages count back from the newest data received, capped at the wall clock.
         # A clock set wrong in either direction, a long outage, or one folder with
         # a garbled future date then cannot make the whole archive look old.
         now = min(time.time(), units[-1][0])
-        protected = now - PRUNE_FLOOR
-        cut = 0  # units[:cut] go
-        if self.keep:
-            while cut < len(units) and units[cut][0] < now - self.keep:
-                cut += 1
-        short = []
-        if self.max_size:
-            total = sum(unit[1] for unit in units[cut:])
-            while total > self.max_size and cut < len(units) and units[cut][0] < protected:
-                total -= units[cut][1]
-                cut += 1
-            if total > self.max_size:
-                short.append(f"still {human(total)} after removing everything older than 3 hours")
-        if self.min_free:
-            disk = shutil.disk_usage(self.catalog.root)
-            kind, value = self.min_free
-            want = value * disk.total if kind == "share" else value
-            lacking = want - disk.free - sum(unit[1] for unit in units[:cut])
-            while lacking > 0 and cut < len(units) and units[cut][0] < protected:
-                lacking -= units[cut][1]
-                cut += 1
-            if lacking > 0:
-                short.append(f"still {human(lacking)} short of the free-space target; something else is using the disk")
-        for problem in short:
-            log(f"prune: {problem}")
-        if cut:
-            self.delete(units[:cut])
-
-    def delete(self, doomed):
+        cut = self.choose(units, self.satdump, now, self.catalog.root, "SatDump data")
+        if not cut:
+            return
+        doomed = units[:cut]
         catalog, root = self.catalog, self.catalog.root
         dead_dirs, dead_files, stale = set(), set(), []
 
@@ -890,17 +992,15 @@ class Pruner(threading.Thread):
                 except OSError:
                     pass
 
-        freed = sum(unit[1] for unit in doomed)
-        summary = (f"{count(len(dead_dirs), 'folder')} and {count(len(dead_files), 'file')} dated up to "
-                   f"{time.strftime('%Y-%m-%d %H:%MZ', time.gmtime(doomed[-1][0]))}"
-                   + (f", {human(freed)}" if self.sizes else ""))
-        self.last = {"t": int(time.time()), "what": summary, "dry": self.dry_run}
+        self.record("satdump", "SatDump data",
+                    f"{count(len(dead_dirs), 'folder')} and {count(len(dead_files), 'file')} dated up to "
+                    f"{time.strftime('%Y-%m-%d %H:%MZ', time.gmtime(doomed[-1][0]))}"
+                    + (f", {human(sum(unit[1] for unit in doomed))}" if sizes else ""))
         if self.dry_run:
-            log(f"prune (dry run): would remove {summary}")
             return
 
         catalog.forget(dead_dirs, dead_files)  # first, so nothing still points at the files
-        for path in stale:
+        for path in stale:  # previews made from the deleted data
             try:
                 os.unlink(path)
             except OSError:
@@ -913,8 +1013,7 @@ class Pruner(threading.Thread):
                 os.unlink(os.path.join(root, *vpath[2:].split("/")))
             except OSError:
                 pass
-        log(f"prune: removed {summary}")
-        catalog.publish("pruned", {"cutoff": int(doomed[-1][0])})
+        catalog.publish("pruned", {"cutoff": int(doomed[-1][0]), "what": "satdump"})
 
 
 # ----------------------------------------------------------------------- http
@@ -1099,12 +1198,16 @@ class App:
         self.catalog, self.previews, self.lut_name, self.verbose = catalog, previews, lut_name, verbose
         self.extra = {}
         self.pruner = None
+        self.colourist = None
 
     def stats(self):
         disk = shutil.disk_usage(self.catalog.root)
+        pruner = self.pruner
         storage = {"free": disk.free, "total": disk.total,
-                   "policy": self.pruner.describe() if self.pruner else None,
-                   "last": self.pruner.last if self.pruner else None}
+                   "cache": pruner.cache.describe() if pruner and pruner.cache else None,
+                   "satdump": pruner.satdump.describe() if pruner and pruner.satdump else None,
+                   "dry": bool(pruner and pruner.dry_run),
+                   "last": pruner.last if pruner else {}}
         return {**self.catalog.stats(), "storage": storage, **self.extra}
 
     def watch(self, interval):
@@ -1133,20 +1236,36 @@ def main():
     ap.add_argument("--warm-hours", type=float, default=24, help="pre-render previews for images this recent (default: %(default)s)")
     ap.add_argument("--workers", type=int, default=2, help="concurrent preview renders (default: %(default)s)")
     ap.add_argument("--interval", type=float, default=3, help="seconds between folder checks (default: %(default)s)")
-    prune = ap.add_argument_group(
-        "retention (off unless a limit is given)",
-        "These DELETE received data from the SatDump folder, oldest first: whole timestamp folders under "
-        "IMAGES/ and L2/, and single files in EMWIN/ and IMAGES/NWS/. Limits combine; data newer than "
-        "3 hours is never deleted. Try a limit with --prune-dry-run first.")
-    prune.add_argument("--keep", type=parse_age, metavar="AGE", help="delete data older than this: 36h, 14d, 2w, 3mo, 1y")
-    prune.add_argument("--max-size", type=parse_size, metavar="SIZE", help="keep the SatDump folder under this size: 500M, 200G, 1.5T")
-    prune.add_argument("--min-free", type=parse_free, metavar="SIZE|N%", help="keep at least this much of the disk free: 20G or 10%%")
-    prune.add_argument("--prune-every", type=float, default=10, metavar="MIN", help="minutes between sweeps (default: %(default)s)")
-    prune.add_argument("--prune-dry-run", action="store_true", help="log what would be deleted, delete nothing")
+    ours = ap.add_argument_group(
+        "GOESview's own files",
+        "The cache of previews and false-colour frames under --cache. Safe to delete: they are rebuilt "
+        "from SatDump's data when needed. These options never touch SatDump's files.")
+    ours.add_argument("--cache-keep", type=parse_age_or_off, default=30 * 86400, metavar="AGE",
+                      help='delete cached files older than this: 36h, 14d, 2w, 3mo; "off" keeps them forever (default: 30d)')
+    ours.add_argument("--cache-max-size", type=parse_size, metavar="SIZE", help="keep the cache under this size: 500M, 20G")
+    ours.add_argument("--cache-disk-cap", type=parse_cap, metavar="N%",
+                      help="when the disk is fuller than this, delete the oldest cached files: 90%%")
+    theirs = ap.add_argument_group(
+        "SatDump's received data",
+        "These PERMANENTLY DELETE files SatDump wrote, oldest first: timestamp folders under IMAGES/ and L2/, "
+        "and files in EMWIN/ and IMAGES/NWS/. None has a default: unless you give one, GOESview never deletes "
+        "anything SatDump received. Data newer than 3 hours is never deleted. Try with --prune-dry-run first.")
+    theirs.add_argument("--satdump-keep", type=parse_age, metavar="AGE", help="delete SatDump data older than this: 30d, 3mo, 1y")
+    theirs.add_argument("--satdump-max-size", type=parse_size, metavar="SIZE", help="keep the SatDump folder under this size: 200G, 1.5T")
+    theirs.add_argument("--satdump-disk-cap", type=parse_cap, metavar="N%",
+                        help="when the disk is fuller than this, delete the oldest SatDump data: 90%%")
+    ap.add_argument("--prune-every", type=float, default=10, metavar="MIN", help="minutes between retention sweeps (default: %(default)s)")
+    ap.add_argument("--prune-dry-run", action="store_true", help="log what retention would delete, delete nothing")
+    for old in ("--keep", "--max-size", "--min-free"):  # early names that did not say whose files they deleted
+        ap.add_argument(old, dest="renamed", help=argparse.SUPPRESS)
     ap.add_argument("--satdump-api", help="URL of SatDump's HTTP stats (satdump live ... --http_server), e.g. http://127.0.0.1:8081/api")
     ap.add_argument("--verbose", action="store_true", help="log every request")
     args = ap.parse_args()
 
+    if args.renamed:
+        ap.error("--keep, --max-size and --min-free were split in two: use --cache-keep / --cache-max-size / "
+                 "--cache-disk-cap for GOESview's own files, or --satdump-keep / --satdump-max-size / "
+                 "--satdump-disk-cap to delete SatDump's received data")
     if not os.path.isdir(args.root):
         sys.exit(f"Not a folder: {args.root}")
     try:  # claim the port first: if it is taken, stop before any background work starts
@@ -1174,15 +1293,21 @@ def main():
             log(f"colour table not found: {args.lut}; false colour disabled")
         else:
             app.lut_name = os.path.splitext(os.path.basename(args.lut))[0]
-            Colourist(catalog, app.lut_name, lut_path, curve_path, args.colour_hours * 3600).start()
+            app.colourist = Colourist(catalog, app.lut_name, lut_path, curve_path, args.colour_hours * 3600)
+            app.colourist.start()
             log(f"false colour: {lut_path}")
 
-    if args.keep or args.max_size or args.min_free:
-        app.pruner = Pruner(app, args.keep, args.max_size, args.min_free, args.prune_every * 60, args.prune_dry_run)
-        log(f"retention: {app.pruner.describe()}, sweeping every {args.prune_every:g} min")
-        app.pruner.start()
+    cache_limits = Limits(args.cache_keep, args.cache_max_size, args.cache_disk_cap)
+    satdump_limits = Limits(args.satdump_keep, args.satdump_max_size, args.satdump_disk_cap)
+    dry = " (dry run)" if args.prune_dry_run else ""
+    log(f"retention, GOESview cache: {cache_limits.describe() if cache_limits else 'kept forever'}{dry}")
+    if satdump_limits:
+        log(f"retention, SatDump data: {satdump_limits.describe()}; OLDER DATA IS DELETED{dry}")
     else:
-        log("retention: off (see --keep, --max-size, --min-free)")
+        log("retention, SatDump data: never deleted (no --satdump-* option given)")
+    if cache_limits or satdump_limits:
+        app.pruner = Pruner(app, cache_limits, satdump_limits, args.prune_every * 60, args.prune_dry_run)
+        app.pruner.start()
 
     if args.satdump_api:
         threading.Thread(target=poll_satdump, args=(args.satdump_api, app.extra), daemon=True).start()

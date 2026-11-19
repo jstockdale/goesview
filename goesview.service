@@ -8,10 +8,12 @@
 # folder itself. SatDump makes a new run folder every time it restarts, and
 # goesview picks up every run it finds underneath.
 #
-# To cap disk use, add retention limits to the end of ExecStart, for example
-#   --keep 14d --min-free 10%
-# These delete the oldest received data. Try them with --prune-dry-run first
-# and read the log. See README.md.
+# Retention: GOESview trims its own cache (30 days by default) and never deletes
+# anything SatDump received. To have it delete old SatDump data as well, add
+# --satdump-* options to the end of ExecStart, for example
+#   --satdump-keep 3mo --satdump-disk-cap 90%
+# Those deletions are permanent. Try them with --prune-dry-run first and read
+# the log. See README.md.
 #
 # Install:
 #   sudo cp goesview.service /etc/systemd/system/
@@ -42,7 +44,8 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 
-# It writes to ~/.cache/goesview, and to the SatDump folder only if retention is on.
+# It writes to ~/.cache/goesview. It deletes from the SatDump folder only if a
+# --satdump-* retention option is given.
 NoNewPrivileges=true
 ProtectSystem=full
 PrivateTmp=true

@@ -18,14 +18,16 @@ weather products and text bulletins appear as they are received.
   composite when band 2 and band 13 land in the same timestamp folder, and the
   HRIT feed regularly files one of them under the previous scan. goesview pairs
   them back up and builds the frame itself.
-- **Retention**: optionally delete the oldest data by age, total size, or free
-  disk space.
+- **Retention**: keeps its own cache trimmed, and can optionally delete the
+  oldest SatDump data by age, size, or disk use. It never deletes SatDump's
+  files unless you ask for that explicitly.
 
 ![Timeline viewer](docs/timeline.jpg)
 
 Python standard library for serving, Pillow for previews, numpy for false
 colour. No build step, no JavaScript dependencies. It never writes inside the
-SatDump folder unless you turn retention on.
+SatDump folder, and never deletes from it unless you give a `--satdump-*`
+retention option.
 
 ## Install
 
@@ -62,33 +64,48 @@ previews for the last 24; on a small machine shorten that with
 
 ## Retention
 
-Off by default. Give one or more limits and goesview deletes the **oldest
-received data from the SatDump folder** to stay within them:
+GOESview handles two kinds of files, and treats them very differently.
+
+**Its own cache** (previews and colour frames, under `--cache`). These are
+rebuilt from SatDump's data whenever needed, so deleting them loses nothing.
+By default GOESview deletes cached files older than 30 days.
 
 | Option | Example | Meaning |
 |---|---|---|
-| `--keep AGE` | `36h`, `14d`, `2w`, `3mo`, `1y` | Delete data older than this. |
-| `--max-size SIZE` | `500M`, `200G`, `1.5T` | Keep the SatDump folder under this size. |
-| `--min-free SIZE\|N%` | `20G`, `10%` | Keep at least this much of the disk free. |
-| `--prune-every MIN` | `10` | Minutes between sweeps. |
-| `--prune-dry-run` | | Log what would be deleted and delete nothing. |
+| `--cache-keep AGE` | `14d`, `3mo`, `off` | Delete cached files older than this. Default `30d`; `off` keeps them forever. |
+| `--cache-max-size SIZE` | `500M`, `20G` | Keep the cache under this size. |
+| `--cache-disk-cap N%` | `90%` | When the disk is fuller than this, delete the oldest cached files. |
 
-    python3 ~/goesview/goesview.py /path/to/satdump-output --keep 14d --min-free 10% --prune-dry-run
+**SatDump's received data.** This cannot be recovered once deleted, so
+**GOESview never deletes it unless you ask by name.** None of these options has
+a default:
 
-How it behaves:
+| Option | Example | Meaning |
+|---|---|---|
+| `--satdump-keep AGE` | `30d`, `3mo`, `1y` | Delete SatDump data older than this. |
+| `--satdump-max-size SIZE` | `200G`, `1.5T` | Keep the SatDump folder under this size. |
+| `--satdump-disk-cap N%` | `90%` | When the disk is fuller than this, delete the oldest SatDump data. |
 
-- It removes whole timestamp folders under `IMAGES/` and `L2/`, and single
-  files in `EMWIN/` and `IMAGES/NWS/`, always oldest first. Previews and
+    python3 ~/goesview/goesview.py /path/to/satdump-output --satdump-keep 3mo --satdump-disk-cap 90% --prune-dry-run
+
+How the SatDump options behave:
+
+- They remove whole timestamp folders under `IMAGES/` and `L2/`, and single
+  files in `EMWIN/` and `IMAGES/NWS/`, always oldest first. The previews and
   colour frames made from deleted data go with them.
-- Limits combine: `--keep 30d --min-free 10%` keeps a month unless the disk
-  gets tight, then trims further.
+- Limits combine: `--satdump-keep 3mo --satdump-disk-cap 90%` keeps three
+  months unless the disk gets tight, then trims further.
 - Data from the last 3 hours is never deleted, whatever the limits say. If a
   limit cannot be met without that, it logs a warning instead.
 - Ages count back from the newest data received, not from the wall clock, so a
   wrong system clock or a long outage cannot make the whole archive look old.
-- The Live page shows free space, the active limits and the last sweep.
 
-Run with `--prune-dry-run` first and read the log.
+`--prune-dry-run` makes both kinds log what they would delete and delete
+nothing; `--prune-every MIN` sets how often it looks (default 10 minutes). The
+Live page shows free space, both policies and the last sweep of each. The log
+states at startup whether SatDump's data can be deleted:
+
+    retention, SatDump data: never deleted (no --satdump-* option given)
 
 ## Colour tables
 
