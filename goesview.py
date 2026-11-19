@@ -489,13 +489,14 @@ class Catalog:
             rate, total, last = {}, {}, {}
             for kind in self.types.values():
                 total[kind.section] = total.get(kind.section, 0) + len(kind.items)
+                if kind.arrivals:  # newest arrival per section, however long ago
+                    last[kind.section] = max(last.get(kind.section, 0), int(kind.arrivals[-1].recv))
             for item in reversed(self.items):
                 age = now - item.recv
                 if age >= 3600:
                     break
                 sec = item.type.section
                 rate.setdefault(sec, [0] * 60)[59 - max(0, int(age // 60))] += 1
-                last.setdefault(sec, int(item.recv))
             scans = []
             for (sec, group), slots in sorted(self.slots.items()):
                 if sec != "imagery" or "Full Disk" not in group:

@@ -98,6 +98,27 @@ body.kiosk #bar { height: 30px; background: transparent; border: 0; }
 .code { font-family: var(--mono); font-size: 11px; color: var(--accent); }
 .code.warn { color: var(--bad); font-weight: 700; }
 
+/* pop-up over the live page */
+dialog.popup { padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); color: var(--text);
+  max-width: 94vw; max-height: 94vh; overflow: hidden; box-shadow: 0 24px 80px rgba(0, 0, 0, .7); }
+dialog.popup[open] { display: flex; flex-direction: column; }
+dialog.popup::backdrop { background: rgba(3, 5, 8, .8); }
+dialog.popup.image { width: fit-content; min-width: min(780px, 94vw); }
+dialog.popup.text { width: min(900px, 94vw); }
+.popup header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; padding: 9px 12px; border-bottom: 1px solid var(--line); flex: none; }
+.popup .what { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 10px; flex: 1; min-width: 0; }
+.popup .what b { font-size: 15px; }
+.popup .what .grp { color: var(--accent); }
+.popup .acts { display: flex; align-items: center; gap: 6px; }
+.popup .body { min-height: 0; overflow: auto; display: flex; justify-content: center; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+.popup.image .body { background: #000; }
+.popup .body img { display: block; max-width: 100%; max-height: calc(94vh - 62px); object-fit: contain; }
+.popup .body pre { margin: 0; padding: 14px 16px; width: 100%; font: 13px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.btn { display: inline-block; background: var(--raise); border: 1px solid var(--line); border-radius: 6px; padding: 4px 9px; white-space: nowrap; }
+.btn:hover { border-color: var(--faint); }
+.btn.go { border-color: var(--accent); color: var(--accent); }
+.bulletin.focus { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+
 /* section pages: sidebar + content */
 .section { height: 100%; display: grid; grid-template-columns: 250px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
 img.broken { visibility: hidden; }

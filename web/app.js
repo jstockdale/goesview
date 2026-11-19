@@ -22,7 +22,9 @@ const state = { types: new Map(), stats: null, view: null, skew: 0, lut: null };
 const enc = p => p.split('/').map(encodeURIComponent).join('/');
 const preview = (p, size) => `/p/${size}/${enc(p)}`;
 const file = p => `/f/${enc(p)}`;
-const typeHref = id => `#/type/${encodeURIComponent(id)}`;
+const typeHref = (id, time) => `#/type/${encodeURIComponent(id)}${time ? `/${time}` : ''}`;
+const textHref = (id, item) => `#/text/${encodeURIComponent(id)}${item ? `/${item}` : ''}`;
+const plainClick = e => !(e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button);
 const getJSON = url => fetch(url).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const pad = n => String(n).padStart(2, '0');
@@ -59,7 +61,7 @@ setInterval(() => {
 /** A tile showing one image item; clicking opens that type's timeline. */
 function tile(item, sizes) {
   const type = state.types.get(item.ty);
-  return h('a', { class: 'tile', href: typeHref(item.ty), 'data-ty': item.ty },
+  return h('a', { class: 'tile', href: typeHref(item.ty, item.t), 'data-ty': item.ty },
     h('img', { loading: 'lazy', alt: '', sizes: sizes || '260px', onerror: e => e.target.classList.add('broken'),
       srcset: `${preview(item.p, 320)} 320w, ${preview(item.p, 960)} 960w`, src: preview(item.p, 320) }),
     h('div', { class: 'cap' },
@@ -86,6 +88,64 @@ function sidebar(section, activeId) {
   el.refresh = debounce(fill, 500);
   return el;
 }
+
+// -------------------------------------------------------------------- pop-up
+
+/** Shows one item over the current page, with a way through to its own page. */
+const popup = (() => {
+  const dlg = h('dialog', { class: 'popup' });
+  document.body.append(dlg);
+  let list = [], at = 0, token = 0;
+  dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });  // a click on the backdrop
+  document.addEventListener('keydown', e => {
+    if (!dlg.open || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+    e.preventDefault();
+    step(e.key === 'ArrowLeft' ? -1 : 1);
+  });
+  function step(d) { if (list.length > 1) { at = (at + d + list.length) % list.length; draw(); } }
+
+  function draw() {
+    const item = list[at], type = state.types.get(item.ty), mine = ++token;
+    const isImage = item.k === 'i', many = list.length > 1;
+    const [code, desc] = !isImage && type ? type.label.split(' · ') : ['', ''];
+    const body = h('div', { class: 'body' });
+    if (isImage) {
+      const img = h('img', { alt: '', src: preview(item.p, 960) });  // already cached; sharpen when ready
+      const sharp = new Image();
+      sharp.onload = () => { if (mine === token) img.src = sharp.src; };
+      sharp.src = preview(item.p, 1920);
+      body.append(img);
+    } else {
+      const pre = h('pre', { text: 'Loading…' });
+      fetch(file(item.p)).then(r => r.text()).then(t => { if (mine === token) pre.textContent = clean(t); })
+        .catch(() => { pre.textContent = 'Could not load this bulletin.'; });
+      body.append(pre);
+    }
+    dlg.className = `popup ${isImage ? 'image' : 'text'}`;
+    dlg.replaceChildren(
+      h('header', {},
+        h('div', { class: 'what' },
+          isImage ? h('b', { text: type ? type.label : '' })
+            : [h('span', { class: 'code' + (WARN_CODES.has(code) ? ' warn' : ''), text: code }), h('b', { text: item.nm || '' })],
+          h('span', { class: 'grp', text: isImage ? (type ? type.grp : '') : (desc || '') }),
+          h('span', { class: 'dim', text: utc(item.t, true) }), agoEl(item.r),
+          item.n && h('span', { class: 'note', text: item.n })),
+        h('div', { class: 'acts' },
+          many && h('button', { title: 'Previous (←)', text: '◀', onclick: () => step(-1) }),
+          many && h('span', { class: 'dim', text: `${at + 1} / ${list.length}` }),
+          many && h('button', { title: 'Next (→)', text: '▶', onclick: () => step(1) }),
+          h('a', { class: 'btn go', href: isImage ? typeHref(item.ty, item.t) : textHref(item.ty, item.id),
+            text: isImage ? 'Open in timeline →' : `See it among ${code || 'similar'} bulletins →` }),
+          h('a', { class: 'btn', href: file(item.p), target: '_blank', rel: 'noopener', text: isImage ? 'Full resolution ↗' : 'Raw ↗' }),
+          h('button', { title: 'Close (Esc)', text: '✕', onclick: () => dlg.close() }))),
+      body);
+  }
+
+  return {
+    open(items, index) { list = items; at = Math.max(0, index); draw(); if (!dlg.open) dlg.showModal(); },
+    close() { if (dlg.open) dlg.close(); },
+  };
+})();
 
 // ---------------------------------------------------------------- live view
 
@@ -140,10 +200,12 @@ function LiveView(root) {
     const latest = [...state.types.values()]
       .filter(t => t.kind === 'i' && t.last && t !== lead)
       .sort((a, b) => b.last.r - a.last.r).slice(0, 12);
-    wall.replaceChildren(...latest.map(t => {
+    const items = latest.map(t => t.last);
+    wall.replaceChildren(...latest.map((t, i) => {
       const el = tile(t.last, '(max-width: 1100px) 33vw, 20vw');
+      el.addEventListener('click', e => { if (plainClick(e)) { e.preventDefault(); popup.open(items, i); } });
       el.append(h('button', { class: 'pin', title: 'Show this type large', text: '★',
-        onclick: e => { e.preventDefault(); store.set('hero', t.id); delete hero.dataset.p; drawHero(); drawWall(); } }));
+        onclick: e => { e.preventDefault(); e.stopPropagation(); store.set('hero', t.id); delete hero.dataset.p; drawHero(); drawWall(); } }));
       if (t.id === freshType) flash(el);
       return el;
     }));
@@ -167,7 +229,7 @@ function LiveView(root) {
       return h('a', { class: 'kpi', href, title: `Show ${label.toLowerCase()} items as received` }, h('label', { text: label }),
         h('b', { text: rate.reduce((a, b) => a + b, 0) }), h('small', { text: '/ hr' }),
         spark(rate.length ? rate : new Array(60).fill(0)),
-        s.last[sec] ? agoEl(s.last[sec]) : h('span', { class: 'ago', text: 'nothing yet' }));
+        s.last[sec] ? agoEl(s.last[sec]) : h('span', { class: 'dim', text: 'nothing yet' }));
     };
     const parts = [h('h3', { text: 'Reception, last hour' }),
       h('div', { class: 'kpis' }, kpi('Imagery', 'imagery'), kpi('Weather', 'weather'), kpi('Text', 'text'))];
@@ -208,17 +270,22 @@ function LiveView(root) {
     tele.replaceChildren(...parts);
   }
 
+  const ticker = [];  // the bulletins on screen, newest first
   function bulletin(item, body) {
     const type = state.types.get(item.ty);
     const code = type ? type.label.slice(0, 3) : '';
-    return h('a', { class: 'row', href: `#/text/${encodeURIComponent(item.ty)}` },
+    return h('a', { class: 'row', href: textHref(item.ty, item.id),
+      onclick: e => { if (plainClick(e)) { e.preventDefault(); popup.open(ticker.slice(), ticker.indexOf(item)); } } },
       h('time', { text: utc(item.t) }),
       h('span', { class: 'code' + (WARN_CODES.has(code) ? ' warn' : ''), text: code }),
       h('span', { class: 'nm', text: item.nm || (type && type.label) || '' }),
       h('span', { class: 'line', text: headline(body) }));
   }
 
-  getJSON('/api/items?sec=text&kind=t&limit=40&body=1').then(d => rows.replaceChildren(...d.items.map(i => bulletin(i, i.b))));
+  getJSON('/api/items?sec=text&kind=t&limit=40&body=1').then(d => {
+    ticker.splice(0, ticker.length, ...d.items);
+    rows.replaceChildren(...d.items.map(i => bulletin(i, i.b)));
+  });
   drawHero(); drawWall(); drawStats(state.stats);
 
   return {
@@ -227,8 +294,8 @@ function LiveView(root) {
       if (item.k === 'i') { drawHero(); drawWall(type.id); return; }
       fetch(file(item.p), { headers: { Range: 'bytes=0-900' } }).then(r => r.text()).then(body => {
         const el = bulletin(item, body);
-        rows.prepend(el); flash(el);
-        while (rows.children.length > 60) rows.lastChild.remove();
+        ticker.unshift(item); rows.prepend(el); flash(el);
+        while (rows.children.length > 60) { rows.lastChild.remove(); ticker.pop(); }
       }).catch(() => {});
     },
     onTypes() { drawHero(); drawWall(); },
@@ -357,7 +424,7 @@ function SectionView(root, section, mode) {
 
 // ---------------------------------------------------- image timeline viewer
 
-function Viewer(root, typeId) {
+function Viewer(root, typeId, atTime) {
   const type = state.types.get(typeId);
   if (!type) { root.append(h('div', { class: 'empty', text: 'No such type (yet).' })); return { nav: '' }; }
 
@@ -380,6 +447,8 @@ function Viewer(root, typeId) {
     el.value = String(value);
     return el;
   };
+  const rangeSel = select(hours, [[6, 'Last 6 h'], [12, 'Last 12 h'], [24, 'Last 24 h'], [48, 'Last 48 h'], [0, 'Everything']],
+    v => { hours = v; store.set('range', v); setRange(); show(idx); });
   const side = sidebar(type.sec, typeId);
 
   root.append(h('div', { class: 'section' }, side,
@@ -391,7 +460,7 @@ function Viewer(root, typeId) {
         playBtn,
         h('button', { title: 'Next frame (→)', text: '▶', onclick: () => step(1) }),
         select(fps, [[2, '2 fps'], [4, '4 fps'], [6, '6 fps'], [10, '10 fps'], [16, '16 fps']], v => { fps = v; store.set('fps', v); }),
-        select(hours, [[6, 'Last 6 h'], [12, 'Last 12 h'], [24, 'Last 24 h'], [48, 'Last 48 h'], [0, 'Everything']], v => { hours = v; store.set('range', v); setRange(); show(idx); }),
+        rangeSel,
         liveBtn, mapBtn, original),
       stage, info, canvas))));
 
@@ -549,7 +618,15 @@ function Viewer(root, typeId) {
 
   getJSON(`/api/timeline?type=${encodeURIComponent(typeId)}`).then(d => {
     if (dead) return;
-    frames = d.frames; setRange(); sync(); show(frames.length - 1);
+    frames = d.frames;
+    let start = frames.length - 1;
+    if (atTime && frames.length) {  // arrived from a link to one frame
+      for (let i = 0; i < frames.length; i++) if (Math.abs(frames[i][0] - atTime) < Math.abs(frames[start][0] - atTime)) start = i;
+      live = start === frames.length - 1;
+    }
+    setRange();
+    if (start < lo) { hours = 0; rangeSel.value = '0'; setRange(); }  // older than the saved range: show everything this once
+    sync(); show(start);
   });
 
   return {
@@ -580,7 +657,7 @@ function Viewer(root, typeId) {
 
 // ---------------------------------------------------------------- text feed
 
-function TextView(root, typeId) {
+function TextView(root, typeId, focusId) {
   const feed = h('div', { class: 'textfeed' });
   const pane = h('div', { class: 'pane scroll' }, feed);
   const sentinel = h('div', { class: 'empty' });
@@ -589,14 +666,15 @@ function TextView(root, typeId) {
   const search = h('input', { type: 'search', style: 'max-width:340px',
     placeholder: 'Filter by product or office, e.g. AFDSEW or KSEW',
     oninput: debounce(() => { query = search.value.trim(); reset(); }, 250) });
-  let query = '', before = 0, loading = false, done = false, run = 0;
+  let query = '', before = focusId ? focusId + 1 : 0, loading = false, done = false, run = 0;
   const active = state.types.get(typeId);
 
   root.append(h('div', { class: 'section' }, side,
     h('div', { class: 'content' },
       h('div', { class: 'tabs' },
         h('b', { text: active ? active.label : 'All text products' }),
-        h('span', { class: 'dim', text: 'newest first, live' }),
+        focusId ? h('a', { class: 'btn', href: textHref(typeId), text: 'Jump to newest ↑' })
+          : h('span', { class: 'dim', text: 'newest first, live' }),
         h('span', { class: 'spacer' }), search),
       pane)));
   pane.append(sentinel);
@@ -626,6 +704,11 @@ function TextView(root, typeId) {
         h('time', { text: utc(item.t, true) }), agoEl(item.r),
         h('a', { href: file(item.p), target: '_blank', rel: 'noopener', text: 'raw' })),
       pre);
+    if (focusId && item.id === focusId) {  // the bulletin a link pointed at: show it whole
+      el.classList.add('focus', 'open');
+      fetch(file(item.p)).then(r => r.text()).then(t => { pre.textContent = clean(t); });
+      return el;
+    }
     const expand = h('button', { class: 'more', text: 'Show all', onclick: async () => {
       pre.textContent = clean(await (await fetch(file(item.p))).text());
       el.classList.add('open'); expand.remove();
@@ -680,11 +763,12 @@ function route() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
   if (state.view && state.view.destroy) state.view.destroy();
   root.replaceChildren();
-  const [page, arg] = parts;
+  popup.close();
+  const [page, arg, extra] = parts;
   if (page === 'type' && state.types.get(arg) && state.types.get(arg).kind === 't') { location.replace(`#/text/${encodeURIComponent(arg)}`); return; }
   if (page === 'imagery' || page === 'weather') state.view = SectionView(root, page, arg === 'feed' ? 'feed' : 'latest');
-  else if (page === 'type') state.view = Viewer(root, arg);
-  else if (page === 'text') state.view = TextView(root, arg || null);
+  else if (page === 'type') state.view = Viewer(root, arg, +extra || 0);
+  else if (page === 'text') state.view = TextView(root, arg || null, +extra || 0);
   else state.view = LiveView(root);
   for (const a of document.querySelectorAll('#nav a')) a.classList.toggle('on', a.dataset.nav === state.view.nav);
 }
