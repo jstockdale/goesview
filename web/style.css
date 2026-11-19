@@ -73,12 +73,19 @@ body.kiosk #bar { height: 30px; background: transparent; border: 0; }
 .kpi svg { display: block; width: 100%; height: 18px; margin: 3px 0 2px; }
 .kpi polyline { fill: none; stroke: var(--accent); stroke-width: 1.2; vector-effect: non-scaling-stroke; }
 .kpi .ago { font-size: 11px; }
-.bands { display: grid; gap: 2px; align-items: center; font-size: 10px; color: var(--dim); font-variant-numeric: tabular-nums; margin-bottom: 4px; }
+.bands { display: grid; gap: 2px; align-items: center; width: max-content; min-width: 100%; font-size: 10px; color: var(--dim); font-variant-numeric: tabular-nums; margin-bottom: 4px; }
 .bands i { display: block; height: 9px; border-radius: 2px; background: var(--raise); }
 .bands i.on { background: var(--good); }
 .bands i.odd { background: var(--warn); }
-.bands .hd { text-align: center; overflow: hidden; }
+.bands .hd { text-align: center; white-space: nowrap; }
 .bands .hd.odd { color: var(--warn); }
+.bands .hd.day { color: var(--text); font-weight: 700; }
+.bands .hd.now { color: var(--accent); font-weight: 700; }
+.bands i.now { box-shadow: 0 0 0 1.5px var(--accent); }
+.where { display: flex; align-items: center; gap: 8px; min-height: 17px; font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; margin-bottom: 3px; }
+.where .spacer { flex: 1; }
+.bands .lab { position: sticky; left: 0; z-index: 1; background: var(--panel); padding-right: 3px; }
+.bandscroll { overflow-x: auto; overflow-anchor: none; scrollbar-width: thin; scrollbar-color: var(--line) transparent; padding: 2px 3px 5px 0; margin-bottom: 2px; }
 .legend { font-size: 11px; color: var(--dim); margin-bottom: 10px; }
 .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin: 0 4px 0 8px; vertical-align: -1px; }
 .meter { height: 6px; border-radius: 3px; background: var(--raise); overflow: hidden; margin-bottom: 5px; }
@@ -88,7 +95,8 @@ body.kiosk #bar { height: 30px; background: transparent; border: 0; }
 .kv span:nth-child(odd) { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .kv span:nth-child(even) { font-family: var(--mono); text-align: right; }
 .ticker { flex: 1; min-height: 0; display: flex; flex-direction: column; padding-bottom: 4px; }
-.ticker .rows { flex: 1; min-height: 0; overflow: hidden; }
+.ticker .rows { flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--line) transparent; padding-right: 4px; overflow-anchor: none; }
+.textpane { overflow-anchor: none; }  /* the script holds the view still itself when items arrive above */
 .row { display: grid; grid-template-columns: 46px 34px minmax(0, 1fr); gap: 0 8px; padding: 4px 0; border-top: 1px solid var(--line); font-size: 12px; }
 .row time { color: var(--dim); font-variant-numeric: tabular-nums; }
 .row .line { grid-column: 2 / -1; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

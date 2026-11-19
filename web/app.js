@@ -149,6 +149,8 @@ const popup = (() => {
 
 // ---------------------------------------------------------------- live view
 
+const TICKER_LOAD = 200;  // bulletins fetched when the Live page opens: roughly the last 15 minutes
+const TICKER_KEEP = 300;  // and how many it holds as new ones arrive
 const WARN_CODES = new Set(['TOR', 'SVR', 'FFW', 'SMW', 'TSU', 'FLW', 'RFW', 'WSW', 'NPW', 'HLS', 'TCP', 'SVS']);
 
 function headline(body) {
@@ -233,20 +235,45 @@ function LiveView(root) {
     };
     const parts = [h('h3', { text: 'Reception, last hour' }),
       h('div', { class: 'kpis' }, kpi('Imagery', 'imagery'), kpi('Weather', 'weather'), kpi('Text', 'text'))];
+    const settle = [];  // run once the strips are on the page
     for (const scan of s.scans) {
       const all = [...new Set(scan.slots.flatMap(x => x.b))].sort((a, b) => a - b);
       if (!all.length) continue;
-      const grid = h('div', { class: 'bands', style: `grid-template-columns: 22px repeat(${scan.slots.length}, minmax(0, 1fr))` });
-      const odd = scan.slots.map(x => x.b.length * 2 < all.length);  // a band filed apart from its scan
-      grid.append(h('span'));
-      scan.slots.forEach((x, i) => grid.append(h('span', { class: 'hd' + (odd[i] ? ' odd' : ''), title: utc(x.t, true),
-        text: odd[i] ? '·' : (new Date(x.t * 1000).getUTCMinutes() ? '' : pad(new Date(x.t * 1000).getUTCHours())) })));
+      const slots = scan.slots, last = slots.length - 1, COL = 13;  // 11px column + 2px gap
+      const grid = h('div', { class: 'bands', style: `grid-template-columns: 20px repeat(${slots.length}, 11px)` });
+      // A band filed apart from its scan: a folder with few bands sitting within 11 minutes of a
+      // fuller one. A scan that is merely still arriving has no such neighbour and is not flagged.
+      const fuller = (i, j) => j >= 0 && j <= last && Math.abs(slots[i].t - slots[j].t) <= 660 && slots[j].b.length > slots[i].b.length;
+      const odd = slots.map((x, i) => x.b.length * 2 < all.length && (fuller(i, i - 1) || fuller(i, i + 1)));
+      grid.append(h('span', { class: 'lab' }));
+      slots.forEach((x, i) => {
+        const d = new Date(x.t * 1000), onHour = !odd[i] && d.getUTCMinutes() === 0;
+        const label = odd[i] ? '·' : onHour ? pad(d.getUTCHours()) : '';
+        grid.append(h('span', { title: utc(x.t, true), text: i === last ? label || '▾' : label,
+          class: 'hd' + (odd[i] ? ' odd' : '') + (onHour && d.getUTCHours() === 0 ? ' day' : '') + (i === last ? ' now' : '') }));
+      });
       for (const band of all) {
-        grid.append(h('span', { text: band }));
-        scan.slots.forEach((x, i) => grid.append(h('i', { class: x.b.includes(band) ? (odd[i] ? 'odd' : 'on') : '',
-          title: `band ${band}, ${utc(x.t, true)}` })));
+        grid.append(h('span', { class: 'lab', text: band }));
+        slots.forEach((x, i) => grid.append(h('i', { title: `band ${band}, ${utc(x.t, true)}`,
+          class: (x.b.includes(band) ? (odd[i] ? 'odd' : 'on') : '') + (i === last ? ' now' : '') })));
       }
-      parts.push(h('h3', { text: `${scan.g}: bands per scan` }), grid,
+      // Where am I: the newest scan is ringed; scrolled back, say what is in view and offer the way home.
+      const scroller = h('div', { class: 'bandscroll', 'data-g': scan.g }, grid);
+      const place = h('span');
+      const home = h('button', { class: 'link', text: 'Back to newest →', hidden: true,
+        onclick: () => scroller.scrollTo({ left: scroller.scrollWidth, behavior: 'smooth' }) });
+      const where = () => {
+        const atEnd = scroller.scrollLeft + scroller.clientWidth >= scroller.scrollWidth - 6;
+        home.hidden = atEnd;
+        if (atEnd) return place.replaceChildren(`Newest scan ${utc(slots[last].t)}, ringed · `, agoEl(slots[last].t));
+        const from = clamp(Math.floor(scroller.scrollLeft / COL), 0, last);
+        const to = clamp(Math.floor((scroller.scrollLeft + scroller.clientWidth - 22) / COL) - 1, from, last);
+        place.replaceChildren(`Viewing ${utc(slots[from].t)} to ${utc(slots[to].t)} · newest is ${utc(slots[last].t)}`);
+      };
+      scroller.addEventListener('scroll', where, { passive: true });
+      settle.push(where);
+      parts.push(h('h3', { text: `${scan.g}: bands per scan, last 24 h` }), scroller,
+        h('div', { class: 'where' }, place, h('span', { class: 'spacer' }), home),
         h('div', { class: 'legend' }, 'UTC hour', h('i', { style: 'background:var(--good)' }), 'received',
           h('i', { style: 'background:var(--warn)' }), 'filed under an earlier scan'));
     }
@@ -267,7 +294,16 @@ function LiveView(root) {
       for (const k of (wanted.length ? wanted : keys).slice(0, 12)) kv.append(h('span', { text: k, title: k }), h('span', { text: s.satdump[k] }));
       parts.push(h('h3', { text: 'SatDump' }), kv);
     }
+    // The panel is redrawn every few seconds: keep each strip where the reader left it,
+    // and pinned to the newest scan unless they scrolled back.
+    const held = new Map([...tele.querySelectorAll('.bandscroll')].map(e =>
+      [e.dataset.g, { left: e.scrollLeft, atEnd: e.scrollLeft + e.clientWidth >= e.scrollWidth - 6 }]));
     tele.replaceChildren(...parts);
+    for (const e of tele.querySelectorAll('.bandscroll')) {
+      const was = held.get(e.dataset.g);
+      e.scrollLeft = !was || was.atEnd ? e.scrollWidth : was.left;
+    }
+    settle.forEach(run => run());
   }
 
   const ticker = [];  // the bulletins on screen, newest first
@@ -282,7 +318,7 @@ function LiveView(root) {
       h('span', { class: 'line', text: headline(body) }));
   }
 
-  getJSON('/api/items?sec=text&kind=t&limit=40&body=1').then(d => {
+  getJSON(`/api/items?sec=text&kind=t&limit=${TICKER_LOAD}&body=1`).then(d => {
     ticker.splice(0, ticker.length, ...d.items);
     rows.replaceChildren(...d.items.map(i => bulletin(i, i.b)));
   });
@@ -293,9 +329,11 @@ function LiveView(root) {
     onItem(item, type) {
       if (item.k === 'i') { drawHero(); drawWall(type.id); return; }
       fetch(file(item.p), { headers: { Range: 'bytes=0-900' } }).then(r => r.text()).then(body => {
-        const el = bulletin(item, body);
-        ticker.unshift(item); rows.prepend(el); flash(el);
-        while (rows.children.length > 60) { rows.lastChild.remove(); ticker.pop(); }
+        const el = bulletin(item, body), reading = rows.scrollTop > 20;
+        ticker.unshift(item); rows.prepend(el);
+        if (reading) rows.scrollTop += el.offsetHeight;  // scrolled back through history: hold the view still
+        else flash(el);
+        while (rows.children.length > TICKER_KEEP) { rows.lastChild.remove(); ticker.pop(); }
       }).catch(() => {});
     },
     onTypes() { drawHero(); drawWall(); },
@@ -659,7 +697,7 @@ function Viewer(root, typeId, atTime) {
 
 function TextView(root, typeId, focusId) {
   const feed = h('div', { class: 'textfeed' });
-  const pane = h('div', { class: 'pane scroll' }, feed);
+  const pane = h('div', { class: 'pane scroll textpane' }, feed);
   const sentinel = h('div', { class: 'empty' });
   const side = h('aside', { class: 'types scroll' });
   const typeFilter = h('input', { type: 'search', placeholder: 'Find a product type…', oninput: () => drawSide() });

@@ -1,4 +1,4 @@
-# goesview
+# GOESview
 
 A live viewer for [SatDump](https://github.com/SatDump/SatDump) GOES HRIT output.
 Point it at the folder SatDump is writing into and open a browser: new images,

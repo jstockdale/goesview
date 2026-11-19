@@ -501,11 +501,16 @@ class Catalog:
             for (sec, group), slots in sorted(self.slots.items()):
                 if sec != "imagery" or "Full Disk" not in group:
                     continue
+                names = sorted(slots)
+                horizon = (stamp(names[-1], "%Y-%m-%d_%H-%M-%S") or 0) - 86400 if names else 0
                 recent = []
-                for name in sorted(slots)[-16:]:
+                for name in names:  # the day leading up to the newest scan
+                    when = stamp(name, "%Y-%m-%d_%H-%M-%S")
+                    if when is None or when < horizon:
+                        continue
                     bands = sorted({int(m.group(2)) for f in slots[name][1]
                                     if (m := BAND_RE.match(f)) and m.group(2).isdigit()})
-                    recent.append({"t": stamp(name, "%Y-%m-%d_%H-%M-%S"), "b": bands})
+                    recent.append({"t": when, "b": bands})
                 scans.append({"g": group, "slots": recent})
             return {"now": int(now), "items": len(self.items), "total": total,
                     "rate": rate, "last": last, "scans": scans}
