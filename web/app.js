@@ -89,6 +89,42 @@ function sidebar(section, activeId) {
   return el;
 }
 
+// --------------------------------------------------------------- live switch
+
+/** Live or paused, for a feed that scrolls. Live means sitting at the top and taking arrivals as
+ *  they come. Scrolling down, or clicking the badge, pauses it: arrivals are only counted, so nothing
+ *  moves under the reader. Going back to live reloads the feed if anything was missed. */
+function liveSwitch(scroller, refresh) {
+  let live = true, missed = 0, byScroll = false;
+  const badge = h('button', { class: 'livebadge on' });
+  function draw() {
+    badge.classList.toggle('on', live);
+    scroller.classList.toggle('paused', !live);
+    badge.textContent = live ? '● Live' : `❚❚ Paused${missed ? ` · ${missed} new` : ''} · back to live ↑`;
+    badge.title = live ? 'New arrivals appear as they come. Click to pause.'
+      : 'Not updating while you look back. Click to return to the newest.';
+  }
+  function set(on, scrolled) {
+    if (on === live) return;
+    live = on;
+    byScroll = !on && !!scrolled;
+    if (on) { const stale = missed; missed = 0; scroller.scrollTop = 0; if (stale) refresh(); }
+    draw();
+  }
+  badge.addEventListener('click', () => set(!live));
+  scroller.addEventListener('scroll', () => {
+    if (live && scroller.scrollTop > 80) set(false, true);
+    else if (!live && byScroll && scroller.scrollTop < 4) set(true);  // scrolled back up to the top
+  }, { passive: true });
+  draw();
+  return {
+    badge,
+    get live() { return live; },
+    missed() { missed++; draw(); },
+    reset() { live = true; missed = 0; byScroll = false; draw(); },
+  };
+}
+
 // -------------------------------------------------------------------- pop-up
 
 /** Shows one item over the current page, with a way through to its own page. */
@@ -155,6 +191,8 @@ const popup = (() => {
 
 const TICKER_LOAD = 200;  // bulletins fetched when the Live page opens: roughly the last 15 minutes
 const TICKER_KEEP = 300;  // and how many it holds as new ones arrive
+const WALL_PAGE = 36;     // images fetched per page on the wall
+const WALL_KEEP = 300;    // tiles kept while live, before the oldest are dropped
 const WARN_CODES = new Set(['TOR', 'SVR', 'FFW', 'SMW', 'TSU', 'FLW', 'RFW', 'WSW', 'NPW', 'HLS', 'TCP', 'SVS']);
 
 function headline(body) {
@@ -168,10 +206,18 @@ function headline(body) {
 function LiveView(root) {
   const hero = h('a', { class: 'hero' });
   const wall = h('div', { class: 'wall' });
+  const wallEnd = h('div', { class: 'feedend' });
+  const wallScroll = h('div', { class: 'wallscroll' }, wall, wallEnd);
   const tele = h('div', { class: 'panel' });
   const rows = h('div', { class: 'rows' });
-  root.append(h('div', { class: 'live' }, hero, wall,
-    h('aside', { class: 'side' }, tele, h('div', { class: 'panel ticker' }, h('h3', { text: 'Latest bulletins' }), rows))));
+  const wallLive = liveSwitch(wallScroll, () => loadWall());
+  const tickLive = liveSwitch(rows, () => loadTicker());
+  root.append(h('div', { class: 'live' }, hero,
+    h('div', { class: 'wallbox' },
+      h('div', { class: 'boxhead' }, h('h3', { text: 'Images as received' }), wallLive.badge), wallScroll),
+    h('aside', { class: 'side' }, tele,
+      h('div', { class: 'panel ticker' },
+        h('div', { class: 'boxhead' }, h('h3', { text: 'Bulletins as received' }), tickLive.badge), rows))));
 
   function heroType() {
     const saved = state.types.get(store.get('hero'));
@@ -201,21 +247,41 @@ function LiveView(root) {
     img.src = preview(item.p, 1920);
   }
 
-  function drawWall(freshType) {
-    const lead = heroType();
-    const latest = [...state.types.values()]
-      .filter(t => t.kind === 'i' && t.last && t !== lead)
-      .sort((a, b) => b.last.r - a.last.r).slice(0, 12);
-    const items = latest.map(t => t.last);
-    wall.replaceChildren(...latest.map((t, i) => {
-      const el = tile(t.last, '(max-width: 1100px) 33vw, 20vw');
-      el.addEventListener('click', e => { if (plainClick(e)) { e.preventDefault(); popup.open(items, i); } });
-      el.append(h('button', { class: 'pin', title: 'Show this type large', text: '★',
-        onclick: e => { e.preventDefault(); e.stopPropagation(); store.set('hero', t.id); delete hero.dataset.p; drawHero(); drawWall(); } }));
-      if (t.id === freshType) flash(el);
-      return el;
-    }));
+  // The wall: every image as it arrives, newest first; scrolling down loads older ones.
+  let shown = [], wallBefore = 0, wallBusy = false, wallDone = false, wallRun = 0;
+  function wallTile(item) {
+    const el = tile(item, '(max-width: 1100px) 33vw, 20vw');
+    el.addEventListener('click', e => { if (plainClick(e)) { e.preventDefault(); popup.open(shown.slice(), shown.indexOf(item)); } });
+    el.append(h('button', { class: 'pin', title: 'Show this type large', text: '★',
+      onclick: e => { e.preventDefault(); e.stopPropagation(); store.set('hero', item.ty); delete hero.dataset.p; drawHero(); loadWall(); } }));
+    return el;
   }
+  async function moreWall() {
+    if (wallBusy || wallDone) return;
+    wallBusy = true;
+    const mine = wallRun, lead = heroType();
+    const d = await getJSON(`/api/items?kind=i&limit=${WALL_PAGE}${wallBefore ? `&before=${wallBefore}` : ''}`).catch(() => null);
+    if (mine !== wallRun) return;
+    wallBusy = false;
+    if (!d) return;
+    for (const item of d.items) {
+      if (lead && item.ty === lead.id) continue;  // the large image already shows this type
+      shown.push(item);
+      wall.append(wallTile(item));
+    }
+    if (d.items.length) wallBefore = d.items[d.items.length - 1].id;
+    wallDone = !d.more;
+    wallEnd.textContent = wallDone ? 'That is everything received.' : '';
+    // A page may not fill a tall screen, and the observer only fires when visibility changes.
+    if (!wallDone && wallEnd.getBoundingClientRect().top < wallScroll.getBoundingClientRect().bottom + 300) moreWall();
+  }
+  function loadWall() {
+    wallRun++; shown = []; wallBefore = 0; wallBusy = wallDone = false;
+    wall.replaceChildren(); wallScroll.scrollTop = 0;
+    moreWall();
+  }
+  const wallWatch = new IntersectionObserver(es => es[0].isIntersecting && moreWall(), { root: wallScroll, rootMargin: '300px' });
+  wallWatch.observe(wallEnd);
 
   function spark(values) {
     const max = Math.max(1, ...values);
@@ -231,7 +297,7 @@ function LiveView(root) {
     if (!s) return;
     const kpi = (label, sec) => {
       const rate = s.rate[sec] || [];
-      const href = sec === 'text' ? '#/text' : `#/${sec}/feed`;
+      const href = `#/${sec}`;
       return h('a', { class: 'kpi', href, title: `Show ${label.toLowerCase()} items as received` }, h('label', { text: label }),
         h('b', { text: rate.reduce((a, b) => a + b, 0) }), h('small', { text: '/ hr' }),
         spark(rate.length ? rate : new Array(60).fill(0)),
@@ -282,14 +348,19 @@ function LiveView(root) {
           h('i', { style: 'background:var(--warn)' }), 'filed under an earlier scan'));
     }
     if (s.storage) {
-      const { free, total, policy, last } = s.storage, gb = n => (n / 2 ** 30).toFixed(n < 100 * 2 ** 30 ? 1 : 0);
-      const used = 1 - free / total;
+      const { free, total, cache, satdump, dry, last } = s.storage, gb = n => (n / 2 ** 30).toFixed(n < 100 * 2 ** 30 ? 1 : 0);
+      const used = 1 - free / total, trial = dry ? ' (dry run)' : '';
+      const sweep = info => info && h('div', {}, `${info.dry ? 'Would remove' : 'Last removed'} ${info.what} · `, agoEl(info.t));
+      // Two kinds of files, shown apart: our own cache, and what SatDump received.
       parts.push(h('h3', { text: 'Storage' }),
         h('div', { class: 'meter', title: `${Math.round(used * 100)}% of the disk used` },
           h('i', { class: used > 0.9 ? 'full' : '', style: `width:${(used * 100).toFixed(1)}%` })),
-        h('div', { class: 'legend' }, `${gb(free)} GB free of ${gb(total)} GB · `,
-          policy || 'no retention limit set',
-          last && h('div', {}, `${last.dry ? 'Would remove' : 'Last removed'} ${last.what} · `, agoEl(last.t))));
+        h('div', { class: 'legend' }, `${gb(free)} GB free of ${gb(total)} GB`),
+        h('div', { class: 'keeps' },
+          h('b', { text: 'GOESview cache' }),
+          h('span', {}, cache ? cache + trial : 'kept forever', sweep(last && last.cache)),
+          h('b', { class: satdump ? 'deletes' : '', text: 'SatDump data' }),
+          h('span', {}, satdump ? `${satdump}; older data is deleted${trial}` : 'never deleted', sweep(last && last.satdump))));
     }
     if (s.satdump) {
       const keys = Object.keys(s.satdump);
@@ -322,26 +393,43 @@ function LiveView(root) {
       h('span', { class: 'line', text: headline(body) }));
   }
 
-  getJSON(`/api/items?sec=text&kind=t&limit=${TICKER_LOAD}&body=1`).then(d => {
-    ticker.splice(0, ticker.length, ...d.items);
-    rows.replaceChildren(...d.items.map(i => bulletin(i, i.b)));
-  });
-  drawHero(); drawWall(); drawStats(state.stats);
+  function loadTicker() {
+    getJSON(`/api/items?sec=text&kind=t&limit=${TICKER_LOAD}&body=1`).then(d => {
+      ticker.splice(0, ticker.length, ...d.items);
+      rows.replaceChildren(...d.items.map(i => bulletin(i, i.b)));
+      rows.scrollTop = 0;
+    });
+  }
+
+  drawHero(); loadWall(); loadTicker(); drawStats(state.stats);
 
   return {
     nav: 'live',
-    onItem(item, type) {
-      if (item.k === 'i') { drawHero(); drawWall(type.id); return; }
+    onItem(item) {
+      if (item.k === 'i') {
+        drawHero();
+        const lead = heroType();
+        if (lead && item.ty === lead.id) return;
+        if (!wallLive.live) return wallLive.missed();  // paused: count it, move nothing
+        shown.unshift(item);
+        const el = wallTile(item);
+        wall.prepend(el); flash(el);
+        while (wall.children.length > WALL_KEEP) {
+          wall.lastChild.remove(); shown.pop();
+          wallDone = false; wallBefore = shown[shown.length - 1].id;
+        }
+        return;
+      }
+      if (!tickLive.live) return tickLive.missed();
       fetch(file(item.p), { headers: { Range: 'bytes=0-900' } }).then(r => r.text()).then(body => {
-        const el = bulletin(item, body), reading = rows.scrollTop > 20;
-        ticker.unshift(item); rows.prepend(el);
-        if (reading) rows.scrollTop += el.offsetHeight;  // scrolled back through history: hold the view still
-        else flash(el);
+        const el = bulletin(item, body);
+        ticker.unshift(item); rows.prepend(el); flash(el);
         while (rows.children.length > TICKER_KEEP) { rows.lastChild.remove(); ticker.pop(); }
       }).catch(() => {});
     },
-    onTypes() { drawHero(); drawWall(); },
+    onTypes() { drawHero(); },
     onStats: drawStats,
+    destroy() { wallWatch.disconnect(); },
   };
 }
 
@@ -361,6 +449,8 @@ function SectionView(root, section, mode) {
   const grid = h('div', { class: 'grid' });
   const sentinel = h('div', { class: 'empty' });
   const watcher = new IntersectionObserver(es => es[0].isIntersecting && more(), { root: pane, rootMargin: '600px' });
+  const live = mode === 'feed' ? liveSwitch(pane, () => redraw())
+    : { badge: null, live: true, missed() {}, reset() {} };  // "latest of each" is always current
 
   const kinds = () => [...state.types.values()].filter(t => t.sec === section && t.kind === 'i');
   const groups = () => [...new Set(kinds().map(t => t.grp))];
@@ -382,14 +472,16 @@ function SectionView(root, section, mode) {
     const chip = (label, value) => h('button', { class: show === value ? 'on' : '', text: label,
       onclick: () => { show = value; store.set(`show:${section}`, value); redraw(); } });
     filters.replaceChildren(...[
-      h('a', { href: `#/${section}`, class: mode === 'latest' ? 'on' : '', text: 'Latest of each type' }),
-      h('a', { href: `#/${section}/feed`, class: mode === 'feed' ? 'on' : '', text: 'Everything as received' }),
-      mixed() && h('span', { class: 'spacer' }),
+      h('a', { href: `#/${section}`, class: mode === 'feed' ? 'on' : '', text: 'Everything as received' }),
+      h('a', { href: `#/${section}/latest`, class: mode === 'latest' ? 'on' : '', text: 'Latest of each type' }),
+      h('span', { class: 'spacer' }),
       mixed() && chip('Processed and raw', 'all'), mixed() && chip('Processed', 'processed'), mixed() && chip('Raw', 'raw'),
+      live.badge,
     ].filter(Boolean));
   }
 
   function redraw() {
+    live.reset();
     drawBars();
     run++; before = 0; done = loading = false;
     watcher.unobserve(sentinel);
@@ -411,15 +503,28 @@ function SectionView(root, section, mode) {
     if (!pane.children.length) pane.append(h('div', { class: 'empty', text: 'Nothing received yet.' }));
   }
 
-  /** As received, but each group keeps its own block rather than one mixed stream. */
+  /** As received, but each group keeps its own block rather than one mixed stream.
+   *  Each block starts with its newest few and can be extended downwards. */
   function drawDigest() {
     const mine = run;
     for (const g of groups()) {
       if (!kinds().some(t => t.grp === g && passes(t))) continue;
       const box = h('div', { class: 'grid', 'data-grp': g });
-      pane.append(heading(g, 'all received'), box);
-      getJSON(`/api/items?sec=${section}&kind=i&limit=${DIGEST}&group=${encodeURIComponent(g)}${rawQuery()}`)
-        .then(d => { if (mine === run) box.replaceChildren(...d.items.map(i => tile(i))); });
+      const older = h('button', { class: 'more', text: 'Show older', hidden: true });
+      let cursor = 0;
+      const load = async count => {
+        older.disabled = true;
+        const d = await getJSON(`/api/items?sec=${section}&kind=i&limit=${count}&group=${encodeURIComponent(g)}${rawQuery()}`
+          + (cursor ? `&before=${cursor}` : ''));
+        if (mine !== run) return;
+        for (const item of d.items) box.append(tile(item));
+        if (d.items.length) cursor = d.items[d.items.length - 1].id;
+        older.hidden = !d.more;
+        older.disabled = false;
+      };
+      older.addEventListener('click', () => load(24));
+      pane.append(heading(g, 'open this group'), box, older);
+      load(DIGEST);
     }
   }
 
@@ -439,6 +544,8 @@ function SectionView(root, section, mode) {
     done = !d.more;
     sentinel.textContent = done ? (grid.children.length ? 'That is everything.' : 'Nothing received yet.') : 'Loading…';
     loading = false;
+    // A page may not fill a tall screen, and the observer only fires when visibility changes.
+    if (!done && sentinel.getBoundingClientRect().top < pane.getBoundingClientRect().bottom + 600) more();
   }
 
   redraw();
@@ -452,11 +559,12 @@ function SectionView(root, section, mode) {
         const old = [...pane.querySelectorAll('.tile')].find(e => e.dataset.ty === item.ty);
         if (!old) return drawLatest();
         const el = tile(type.last); old.replaceWith(el); flash(el);
+      } else if (!live.live) {
+        live.missed();  // paused: count it, move nothing
       } else if (overview()) {
         const box = [...pane.querySelectorAll('.grid')].find(e => e.dataset.grp === type.grp);
         if (!box) return redraw();
         const el = tile(item); box.prepend(el); flash(el);
-        while (box.children.length > DIGEST) box.lastChild.remove();
       } else { const el = tile(item); grid.prepend(el); flash(el); }
     },
     onTypes() { side.refresh(); drawBars(); if (mode === 'latest') drawLatest(); },
@@ -685,7 +793,8 @@ function Viewer(root, typeId, atTime) {
       if (live && !playing) show(frames.length - 1); else draw();
     },
     onTypes() { side.refresh(); },
-    onPruned(cutoff) {
+    onPruned(cutoff, what) {
+      if (what === 'cache' && !(frames[0] && frames[0][1].startsWith('d/'))) return;  // only our own colour frames went
       const current = idx >= 0 && frames[idx];
       frames = frames.filter(f => f[0] > cutoff);
       if (!frames.length) { pause(); idx = -1; return; }
@@ -808,7 +917,7 @@ function route() {
   popup.close();
   const [page, arg, extra] = parts;
   if (page === 'type' && state.types.get(arg) && state.types.get(arg).kind === 't') { location.replace(`#/text/${encodeURIComponent(arg)}`); return; }
-  if (page === 'imagery' || page === 'weather') state.view = SectionView(root, page, arg === 'feed' ? 'feed' : 'latest');
+  if (page === 'imagery' || page === 'weather') state.view = SectionView(root, page, arg === 'latest' ? 'latest' : 'feed');
   else if (page === 'type') state.view = Viewer(root, arg, +extra || 0);
   else if (page === 'text') state.view = TextView(root, arg || null, +extra || 0);
   else state.view = LiveView(root);
@@ -830,14 +939,21 @@ function connect() {
   es.onerror = () => { dot.classList.remove('ok'); dot.title = 'Reconnecting…'; };
   es.addEventListener('item', e => {
     const item = JSON.parse(e.data), type = state.types.get(item.ty);
-    if (!type) return reloadTypes();  // first item of a new type
+    if (!type) {  // first item of a new type: fetch the type list, then deliver the item as usual
+      loadTypes().then(() => {
+        const fresh = state.types.get(item.ty);
+        if (state.view && state.view.onTypes) state.view.onTypes();
+        if (fresh && state.view && state.view.onItem) state.view.onItem(item, fresh);
+      });
+      return;
+    }
     type.n++;
     if (!type.last || item.t >= type.last.t) type.last = item;
     if (state.view && state.view.onItem) state.view.onItem(item, type);
   });
   es.addEventListener('pruned', e => {  // old data was deleted on the server
-    const { cutoff } = JSON.parse(e.data);
-    if (state.view && state.view.onPruned) state.view.onPruned(cutoff);
+    const { cutoff, what } = JSON.parse(e.data);
+    if (state.view && state.view.onPruned) state.view.onPruned(cutoff, what);
     reloadTypes();
   });
   es.addEventListener('stats', e => {
