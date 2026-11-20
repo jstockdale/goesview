@@ -13,7 +13,8 @@ weather products and text bulletins appear as they are received.
   the order it arrived. Processed composites and raw channels can be filtered.
 - **Timeline** for every image type: scrub, play, zoom and pan, map overlay,
   follow new frames live.
-- **Text**: the EMWIN feed as it arrives, by product type or office.
+- **Text**: the EMWIN feed as it arrives, by product type or office, with
+  full-text search across every bulletin.
 - **False colour that survives split scans.** SatDump only builds its colour
   composite when band 2 and band 13 land in the same timestamp folder, and the
   HRIT feed regularly files one of them under the previous scan. goesview pairs
@@ -59,8 +60,15 @@ previews for the last 24; on a small machine shorten that with
 | `--warm-hours` | 24 | Pre-render previews for images this recent. |
 | `--workers` | 2 | Concurrent preview renders. |
 | `--satdump-api` | off | URL of SatDump's own HTTP stats, to show signal numbers on the Live page. |
+| `--no-text-index` | | Skip the full-text search index for the Text page. |
 
 `--help` lists everything.
+
+The Text page's search box looks through the full text of every bulletin as
+well as product and office codes: every word must appear, and a phrase in
+quotes must match exactly. The index behind it lives in the cache folder as
+`text-index.sqlite3` and takes about twice the size of the bulletin text; it
+is built in the background on first start and kept current after that.
 
 ## Retention
 

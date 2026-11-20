@@ -324,8 +324,13 @@ function LiveView(root) {
       });
       for (const band of all) {
         grid.append(h('span', { class: 'lab', text: band }));
-        slots.forEach((x, i) => grid.append(h('i', { title: `band ${band}, ${utc(x.t, true)}`,
-          class: (x.b.includes(band) ? (odd[i] ? 'odd' : 'on') : '') + (i === last ? ' now' : '') })));
+        slots.forEach((x, i) => {
+          const got = x.b.includes(band);
+          grid.append(h('i', { 'data-band': band, 'data-time': x.t,
+            title: got ? `Band ${band}, ${utc(x.t, true)}${odd[i] ? ', filed under an earlier scan' : ''}. Click to view.`
+              : `Band ${band} not received for ${utc(x.t, true)}`,
+            class: (got ? (odd[i] ? 'odd' : 'on') : '') + (i === last ? ' now' : '') }));
+        });
       }
       // Where am I: the newest scan is ringed; scrolled back, say what is in view and offer the way home.
       const scroller = h('div', { class: 'bandscroll', 'data-g': scan.g }, grid);
@@ -388,6 +393,21 @@ function LiveView(root) {
     }
     settle.forEach(run => run());
   }
+
+  // A filled box in a bands-per-scan strip opens that band's image for that scan;
+  // the arrows then step through the same band over time, as the strip does.
+  tele.addEventListener('click', async e => {
+    const cell = e.target.closest('.bands i.on, .bands i.odd');
+    if (!cell) return;
+    const group = cell.closest('.bandscroll').dataset.g, band = cell.dataset.band, time = +cell.dataset.time;
+    const type = [...state.types.values()].find(t => t.kind === 'i' && t.grp === group && (t.label === `Band ${band}` || t.label.startsWith(`Band ${band} ·`)));
+    if (!type) return;
+    const d = await getJSON(`/api/timeline?type=${encodeURIComponent(type.id)}`).catch(() => null);
+    if (!d) return;
+    const frames = d.frames.map(f => ({ k: 'i', ty: type.id, t: f[0], r: f[0], p: f[1], m: f[2] || undefined, n: f[3] || undefined, s: f[4] }));
+    const at = frames.findIndex(f => f.t === time);
+    if (at >= 0) popup.open(frames, at);
+  });
 
   const ticker = [];  // the bulletins on screen, newest first
   function bulletin(item, body) {
@@ -822,9 +842,11 @@ function TextView(root, typeId, focusId) {
   const sentinel = h('div', { class: 'empty' });
   const side = h('aside', { class: 'types scroll' });
   const typeFilter = h('input', { type: 'search', placeholder: 'Find a product type…', oninput: () => drawSide() });
-  const search = h('input', { type: 'search', style: 'max-width:340px',
-    placeholder: 'Filter by product or office, e.g. AFDSEW or KSEW',
-    oninput: debounce(() => { query = search.value.trim(); reset(); }, 250) });
+  const search = h('input', { type: 'search', style: 'max-width:380px',
+    placeholder: 'Search the text, product or office: flood warning, AFDSEW, "winter storm"',
+    title: 'Every word must appear. Put a phrase in "quotes" to match it exactly. Product and office codes work too.',
+    oninput: debounce(() => { query = search.value.trim(); reset(); }, 300) });
+  const status = h('span', { class: 'dim', text: 'newest first, live' });
   let query = '', before = focusId ? focusId + 1 : 0, loading = false, done = false, run = 0;
   const active = state.types.get(typeId);
 
@@ -832,8 +854,7 @@ function TextView(root, typeId, focusId) {
     h('div', { class: 'content' },
       h('div', { class: 'tabs' },
         h('b', { text: active ? active.label : 'All text products' }),
-        focusId ? h('a', { class: 'btn', href: textHref(typeId), text: 'Jump to newest ↑' })
-          : h('span', { class: 'dim', text: 'newest first, live' }),
+        focusId ? h('a', { class: 'btn', href: textHref(typeId), text: 'Jump to newest ↑' }) : status,
         h('span', { class: 'spacer' }), search),
       pane)));
   pane.append(sentinel);
@@ -855,6 +876,10 @@ function TextView(root, typeId, focusId) {
     const type = state.types.get(item.ty);
     const [code, desc] = type ? type.label.split(' · ') : ['', ''];
     const pre = h('pre', { text: item.b ? clean(item.b) : '' });
+    // A search hit arrives with the passage that matched, the matching words marked off.
+    const marked = item.hit && item.hit.includes('\x02');
+    const excerpt = marked && h('div', { class: 'excerpt' },
+      item.hit.split(/\x02(.*?)\x03/s).map((part, i) => i % 2 ? h('mark', { text: part }) : part.replace(/\s+/g, ' ')));
     const el = h('article', { class: 'bulletin' },
       h('header', {},
         h('span', { class: 'code' + (WARN_CODES.has(code) ? ' warn' : ''), text: code }),
@@ -862,7 +887,7 @@ function TextView(root, typeId, focusId) {
         h('span', { class: 'lbl', text: desc || '' }),
         h('time', { text: utc(item.t, true) }), agoEl(item.r),
         h('a', { href: file(item.p), target: '_blank', rel: 'noopener', text: 'raw' })),
-      pre);
+      excerpt, pre);
     if (focusId && item.id === focusId) {  // the bulletin a link pointed at: show it whole
       el.classList.add('focus', 'open');
       fetch(file(item.p)).then(r => r.text()).then(t => { pre.textContent = clean(t); });
@@ -888,12 +913,21 @@ function TextView(root, typeId, focusId) {
     const d = await getJSON(url);
     if (mine !== run) return;
     for (const item of d.items) feed.append(card(item));
-    if (d.items.length) before = d.items[d.items.length - 1].id;
+    if (d.cursor != null) before = d.cursor;  // a search hands back where it got to
+    else if (d.items.length) before = d.items[d.items.length - 1].id;
     done = !d.more;
-    sentinel.textContent = done ? (feed.children.length ? 'That is everything.' : 'Nothing matches.') : 'Loading…';
+    const building = d.index && !d.index.ready
+      ? ` The search index is still being built (${d.index.total ? Math.round(100 * d.index.done / d.index.total) : 0}%), so older bulletins may be missing for now.` : '';
+    sentinel.textContent = (done ? (feed.children.length ? 'That is everything.' : 'Nothing matches.') : 'Loading…') + building;
     loading = false;
+    if (!done && sentinel.getBoundingClientRect().top < pane.getBoundingClientRect().bottom + 800) more();
   }
-  function reset() { run++; before = 0; done = loading = false; feed.replaceChildren(); more(); }
+  function reset() {
+    run++; before = 0; done = loading = false;
+    status.textContent = query ? 'matches, newest first' : 'newest first, live';
+    feed.replaceChildren(); pane.scrollTop = 0;
+    more();
+  }
 
   drawSide(); watcher.observe(sentinel); more();
 
@@ -903,7 +937,7 @@ function TextView(root, typeId, focusId) {
       if (item.k !== 't') return;
       refreshSide();
       if (typeId && item.ty !== typeId) return;
-      if (query && !(item.nm || type.label).toLowerCase().includes(query.toLowerCase())) return;
+      if (query) return;  // a search is a snapshot; run it again to include what has arrived since
       const el = card(item), reading = pane.scrollTop > 60;
       feed.prepend(el);
       if (reading) pane.scrollTop += el.offsetHeight + 10; else flash(el);  // do not shove text someone is reading

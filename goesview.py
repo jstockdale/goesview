@@ -36,12 +36,14 @@ import posixpath
 import queue
 import re
 import shutil
+import sqlite3
 import sys
 import threading
 import time
 import traceback
 import urllib.parse
 import urllib.request
+import zlib
 from datetime import timedelta
 from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -450,6 +452,24 @@ class Catalog:
                     break
             return out[:limit], len(out) > limit
 
+    def search_text(self, index, text, type_id=None, before=None, limit=30):
+        """Full-text matches newest first, as ([(item, excerpt)], cursor, more)."""
+        out, cursor, more = [], before, False
+        for _ in range(25):  # a type filter may discard most hits; look further, within reason
+            rows = index.search(text, cursor, 200)
+            with self.lock:
+                for rowid, path, excerpt in rows:
+                    item = self.by_path.get(path)
+                    if item is not None and (not type_id or item.type.id == type_id):
+                        if len(out) == limit:
+                            return out, cursor, True
+                        out.append((item, excerpt))
+                    cursor = rowid
+            more = len(rows) == 200
+            if not more:
+                break
+        return out, cursor, more
+
     def since(self, last_id, limit=300):
         with self.lock:
             return [i.as_dict() for i in self.recent if i.id > last_id][-limit:]
@@ -723,6 +743,167 @@ def poll_satdump(url, state):
         time.sleep(2)
 
 
+# ---------------------------------------------------------------- text search
+
+def fts_query(text):
+    """What someone typed, as an FTS5 query: every word must appear (matching from
+    the start of a word), and "quoted phrases" must appear exactly."""
+    parts = []
+    for phrase, word in re.findall(r'"([^"]+)"|(\S+)', text):
+        if phrase:
+            words = re.sub(r"[^\w]+", " ", phrase).split()
+            if words:
+                parts.append('"' + " ".join(words) + '"')
+        else:
+            parts += [f'"{w}"*' for w in re.sub(r"[^\w]+", " ", word).split()]
+    return " ".join(parts)
+
+
+class TextIndex(threading.Thread):
+    """Full-text search over the text bulletins: an SQLite FTS5 index in the cache folder.
+
+    Row ids encode arrival time, so "newest first" is the index's natural order and
+    a page of results costs the same however many bulletins match.
+    """
+    SCHEMA = """
+        CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, id INTEGER UNIQUE);
+        CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(name, body, path UNINDEXED);
+    """
+    LIMIT = 100_000  # bytes of a bulletin that are indexed; a few data tables run far longer
+
+    def __init__(self, catalog, path):
+        super().__init__(daemon=True, name="text-index")
+        self.catalog, self.path = catalog, path
+        self.jobs = queue.Queue()
+        self.total = self.done = 0  # progress of the catch-up after start
+        self.ready = False
+        db = self.connect()
+        db.executescript(self.SCHEMA)  # raises here if this SQLite has no FTS5
+        db.close()
+        catalog.listeners.append(self.on_item)
+
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=30)
+        try:
+            db.execute("PRAGMA journal_mode=WAL")  # readers keep working while it writes
+            db.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.OperationalError:
+            pass  # some filesystems cannot do WAL; the default journal still works
+        return db
+
+    def on_item(self, item, live):
+        if live and item.kind == "text":
+            self.jobs.put(("add", item.path, item.recv, item.name or ""))
+
+    def forget(self, paths):
+        self.jobs.put(("drop", [p for p in paths if p.lower().endswith(".txt")]))
+
+    # -- writing: one thread owns it
+
+    def run(self):
+        db = self.connect()
+        try:
+            self.catch_up(db)
+        except Exception:
+            traceback.print_exc()
+        self.ready = True
+        while True:
+            self.drain(db, block=True)
+
+    def drain(self, db, block=False):
+        try:
+            job = self.jobs.get(block=block)
+        except queue.Empty:
+            return
+        for _ in range(500):
+            try:
+                if job[0] == "add":
+                    self.add(db, *job[1:])
+                else:
+                    for path in job[1]:
+                        self.drop(db, path)
+            except Exception as exc:
+                log(f"text index: {exc}")
+            try:
+                job = self.jobs.get_nowait()
+            except queue.Empty:
+                break
+        db.commit()
+
+    def catch_up(self, db):
+        """Index what arrived while GOESview was not running, newest first, and
+        drop what has since been deleted."""
+        known = {row[0] for row in db.execute("SELECT path FROM files")}
+        with self.catalog.lock:
+            texts = [(i.path, i.recv, i.name or "") for i in self.catalog.items if i.kind == "text"]
+        present = {path for path, _, _ in texts}
+        for path in known - present:
+            self.drop(db, path)
+        db.commit()
+        todo = [t for t in reversed(texts) if t[0] not in known]
+        self.total = len(todo)
+        if todo:
+            log(f"text index: adding {len(todo)} bulletins")
+        started = time.time()
+        for start in range(0, len(todo), 250):
+            for job in todo[start:start + 250]:
+                self.add(db, *job)
+            db.commit()
+            self.done = min(len(todo), start + 250)
+            self.drain(db)       # keep up with arrivals meanwhile
+            time.sleep(0.02)     # and leave the disk some room for everything else
+        if todo:
+            log(f"text index: caught up in {time.time() - started:.0f}s")
+
+    def add(self, db, path, recv, name):
+        if db.execute("SELECT 1 FROM files WHERE path = ?", (path,)).fetchone():
+            return
+        source = self.catalog.resolve(path)
+        try:
+            with open(source, "rb") as f:
+                body = CONTROL_RE.sub(" ", f.read(self.LIMIT).decode("latin-1"))
+        except (OSError, TypeError):
+            return
+        # "AFDSEWWA · FXUS66 KSEW" also answers to its parts: AFD, SEW, WA
+        ident = name.split(" ")[0] if name else ""
+        keys = f"{name} {ident[:3]} {ident[3:6]} {ident[6:]}" if len(ident) == 8 else name
+        rowid = int(recv) * 100_000 + zlib.crc32(path.encode()) % 100_000
+        while True:  # bulletins landing in the same second share a prefix; step past any clash
+            try:
+                db.execute("INSERT INTO files (path, id) VALUES (?, ?)", (path, rowid))
+                break
+            except sqlite3.IntegrityError:
+                rowid += 1
+        db.execute("INSERT INTO docs (rowid, name, body, path) VALUES (?, ?, ?, ?)", (rowid, keys, body, path))
+
+    def drop(self, db, path):
+        row = db.execute("SELECT id FROM files WHERE path = ?", (path,)).fetchone()
+        if row:
+            db.execute("DELETE FROM docs WHERE rowid = ?", row)
+            db.execute("DELETE FROM files WHERE path = ?", (path,))
+
+    # -- reading: any thread, its own connection
+
+    def search(self, text, before=None, limit=200):
+        """Matches newest first as (row id, path, excerpt). Excerpts mark the hit with \x02 and \x03."""
+        match = fts_query(text)
+        if not match:
+            return []
+        db = self.connect()
+        try:
+            return db.execute(
+                "SELECT rowid, path, snippet(docs, 1, char(2), char(3), ' … ', 28) FROM docs WHERE docs MATCH ?"
+                + (" AND rowid < ?" if before else "") + " ORDER BY rowid DESC LIMIT ?",
+                (match, before, limit) if before else (match, limit)).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            db.close()
+
+    def progress(self):
+        return {"ready": self.ready, "done": self.done, "total": self.total}
+
+
 # ------------------------------------------------------------------ retention
 #
 # Two kinds of files, kept strictly apart:
@@ -846,12 +1027,18 @@ class Limits:
         return "keeping " + ", ".join(parts)
 
 
+def on_disk(st):
+    """Space a file really occupies. On drives with large clusters a small file takes
+    far more than its length, and that is what deleting it gives back."""
+    return st.st_blocks * 512 if getattr(st, "st_blocks", 0) else st.st_size
+
+
 def tree_size(folder):
     total = 0
     for base, _, names in os.walk(folder):
         for name in names:
             try:
-                total += os.lstat(os.path.join(base, name)).st_size
+                total += on_disk(os.lstat(os.path.join(base, name)))
             except OSError:
                 pass
     return total
@@ -895,7 +1082,7 @@ class Pruner(threading.Thread):
         """
         if unit[1] is None:
             try:
-                unit[1] = tree_size(unit[2]) if unit[3] else os.lstat(unit[2]).st_size
+                unit[1] = tree_size(unit[2]) if unit[3] else on_disk(os.lstat(unit[2]))
             except OSError:
                 unit[1] = 0
         return unit[1]
@@ -948,7 +1135,7 @@ class Pruner(threading.Thread):
                         st = os.lstat(os.path.join(base, name))
                     except OSError:
                         continue
-                    found.append([st.st_mtime, st.st_size, os.path.join(base, name), False])
+                    found.append([st.st_mtime, on_disk(st), os.path.join(base, name), False])
         found.sort(key=lambda unit: unit[0])
         return found
 
@@ -1120,6 +1307,8 @@ class Pruner(threading.Thread):
             return
 
         catalog.forget(dead_dirs, dead_files)  # first, so nothing still points at the files
+        if self.app.text_index:
+            self.app.text_index.forget(dead_files)
         for path in stale:  # previews made from the deleted data
             try:
                 os.unlink(path)
@@ -1191,6 +1380,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.events()
         if name == "types":
             body = {"now": int(time.time()), "types": catalog.type_list(), "lut": self.app.lut_name}
+        elif name == "items" and params.get("q") and params.get("kind") == "t" and self.app.text_index:
+            # the Text page's search box: full text, plus product and office names
+            hits, cursor, more = catalog.search_text(self.app.text_index, params["q"], params.get("type"),
+                                                     int(params.get("before", 0)) or None,
+                                                     min(int(params.get("limit", 30)), 100))
+            rows = []
+            for item, excerpt in hits:
+                row = item.as_dict()
+                row["hit"] = excerpt
+                row["b"], row["more"] = snippet(catalog.resolve(item.path))
+                rows.append(row)
+            body = {"items": rows, "more": more, "cursor": cursor, "index": self.app.text_index.progress()}
         elif name == "items":
             items, more = catalog.feed(params.get("sec"), params.get("type"),
                                        {"i": "image", "t": "text"}.get(params.get("kind")),
@@ -1319,6 +1520,7 @@ class App:
         self.extra = {}
         self.pruner = None
         self.colourist = None
+        self.text_index = None
 
     def stats(self):
         disk = shutil.disk_usage(self.catalog.root)
@@ -1387,6 +1589,8 @@ def main():
     ap.add_argument("--prune-dry-run", action="store_true", help="log what retention would delete, delete nothing")
     for old in ("--keep", "--max-size", "--min-free"):  # early names that did not say whose files they deleted
         ap.add_argument(old, dest="renamed", help=argparse.SUPPRESS)
+    ap.add_argument("--no-text-index", action="store_true",
+                    help="do not build the full-text search index for the Text page (it takes about twice the size of the bulletin text)")
     ap.add_argument("--satdump-api", help="URL of SatDump's HTTP stats (satdump live ... --http_server), e.g. http://127.0.0.1:8081/api")
     ap.add_argument("--verbose", action="store_true", help="log every request")
     args = ap.parse_args()
@@ -1425,6 +1629,14 @@ def main():
             app.colourist = Colourist(catalog, app.lut_name, lut_path, curve_path, args.colour_hours * 3600)
             app.colourist.start()
             log(f"false colour: {lut_path}")
+
+    if not args.no_text_index:
+        try:
+            os.makedirs(args.cache, exist_ok=True)
+            app.text_index = TextIndex(catalog, os.path.join(args.cache, "text-index.sqlite3"))
+            app.text_index.start()
+        except Exception as exc:
+            log(f"full-text search unavailable ({exc}); the Text page filters by product and office only")
 
     cache_limits = Limits(args.cache_keep, args.cache_max_size, args.cache_disk_cap)
     satdump_limits = Limits(args.satdump_keep, args.satdump_max_size, args.satdump_disk_cap)
