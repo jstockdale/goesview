@@ -1005,26 +1005,36 @@ class TextIndex(threading.Thread):
                 break
         self.save(db)
 
-    def fill(self, db, todo):
-        """Index (path, arrival, name) triples, staying out of the way of everything else."""
-        for start in range(0, len(todo), 500):
-            for job in todo[start:start + 500]:
-                self.add(db, *job)
+    def fill(self, db, items):
+        """Index catalog items, staying out of the way of everything else.
+
+        Each item's path is read at the moment it is indexed, not when the list was made:
+        the archiver may pack a bulletin into its day's zip in between, and it must then
+        be read from, and filed under, where it is now.
+        """
+        for start in range(0, len(items), 500):
+            for item in items[start:start + 500]:
+                for _ in range(3):  # moved while being read: go again with its new path
+                    path = item.path
+                    if self.add(db, path, item.recv, item.name or "") or item.path == path:
+                        break
             self.save(db)
-            self.done = min(len(todo), start + 500)
+            self.done = min(len(items), start + 500)
             time.sleep(0.02)
+        db.execute("INSERT INTO docs (docs) VALUES ('optimize')")  # merge the index into its compact form
+        db.commit()
 
     def catch_up(self, db):
         """Index what arrived while GOESview was not running, newest first, and forget
         what has since been deleted."""
         known = {row[0] for row in db.execute("SELECT path FROM files")}
         with self.catalog.lock:
-            texts = [(i.path, i.recv, i.name or "") for i in self.catalog.items if i.kind == "text"]
-        present = {path for path, _, _ in texts}
+            texts = [i for i in self.catalog.items if i.kind == "text"]
+            present = {i.path for i in texts}
+            todo = [i for i in reversed(texts) if i.path not in known]
         for path in known - present:
             self.drop(db, path)
         self.save(db)
-        todo = [t for t in reversed(texts) if t[0] not in known]
         self.total = len(todo)
         if todo:
             log(f"text index: adding {len(todo)} bulletins")
@@ -1044,7 +1054,7 @@ class TextIndex(threading.Thread):
         fresh = self.connect(fresh_path)
         fresh.executescript(self.SCHEMA)
         with self.catalog.lock:
-            texts = [(i.path, i.recv, i.name or "") for i in reversed(self.catalog.items) if i.kind == "text"]
+            texts = [i for i in reversed(self.catalog.items) if i.kind == "text"]
         self.indexed = self.dropped = 0
         self.fill(fresh, texts)
         fresh.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -1061,11 +1071,12 @@ class TextIndex(threading.Thread):
         return self.connect()
 
     def add(self, db, path, recv, name):
+        """Index one bulletin. False if its text could not be read."""
         if db.execute("SELECT 1 FROM files WHERE path = ?", (path,)).fetchone():
-            return
+            return True
         body = self.text_of(path)
         if body is None:
-            return
+            return False
         # "AFDSEWWA · FXUS66 KSEW" also answers to its parts: AFD, SEW, WA
         ident = name.split(" ")[0] if name else ""
         keys = f"{name} {ident[:3]} {ident[3:6]} {ident[6:]}" if len(ident) == 8 else name
@@ -1078,6 +1089,7 @@ class TextIndex(threading.Thread):
                 rowid += 1
         db.execute("INSERT INTO docs (rowid, name, body) VALUES (?, ?, ?)", (rowid, keys, body))
         self.indexed += 1
+        return True
 
     def drop(self, db, path):
         if db.execute("DELETE FROM files WHERE path = ?", (path,)).rowcount:
