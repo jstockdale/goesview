@@ -92,8 +92,10 @@ body.kiosk #bar { height: 30px; background: transparent; border: 0; }
 .bands i { display: block; height: 9px; border-radius: 2px; background: var(--raise); }
 .bands i.on { background: var(--good); }
 .bands i.odd { background: var(--warn); }
-.bands i.on, .bands i.odd { cursor: pointer; transition: transform .08s, filter .08s; }
-.bands i.on:hover, .bands i.odd:hover { transform: scale(1.5); filter: brightness(1.35); position: relative; z-index: 2; }
+.bands i.on, .bands i.odd { cursor: pointer; }
+.bands i.on:hover, .bands i.odd:hover { outline: 1.5px solid var(--text); outline-offset: 1px; }
+.bands i.sel { outline: 2px solid #fff; outline-offset: 1px; }
+.row.sel { background: var(--raise); box-shadow: inset 2px 0 var(--accent); }
 .bands .hd { text-align: center; white-space: nowrap; }
 .bands .hd.odd { color: var(--warn); }
 .bands .hd.day { color: var(--text); font-weight: 700; }
@@ -134,6 +136,8 @@ dialog.popup { padding: 0; border: 1px solid var(--line); border-radius: 12px; b
 dialog.popup[open] { display: flex; flex-direction: column; }
 dialog.popup::backdrop { background: rgba(3, 5, 8, .8); }
 dialog.popup.text { width: min(900px, 94vw); }
+/* docked over the Live page's image area: not modal, so the right-hand bar stays in reach */
+dialog.popup.docked { position: fixed; margin: 0; z-index: 30; box-shadow: 0 10px 40px rgba(0, 0, 0, .6); }
 .popup header { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 14px;
   padding: 8px 12px; border-bottom: 1px solid var(--line); flex: none; }
 .popup .nav, .popup .acts { display: flex; align-items: center; gap: 6px; }

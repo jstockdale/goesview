@@ -19,6 +19,8 @@ weather products and text bulletins appear as they are received.
   composite when band 2 and band 13 land in the same timestamp folder, and the
   HRIT feed regularly files one of them under the previous scan. goesview pairs
   them back up and builds the frame itself.
+- **Bulletin archive**: optionally packs each finished day's text bulletins
+  into one zip, which saves a great deal of space on large-cluster drives.
 - **Retention**: keeps its own cache trimmed, and can optionally delete the
   oldest SatDump data by age, size, or disk use. It never deletes SatDump's
   files unless you ask for that explicitly.
@@ -133,6 +135,36 @@ Live page shows free space, both policies and the last sweep of each. The log
 states at startup whether SatDump's data can be deleted:
 
     retention, SatDump data: never deleted (no --satdump-* option given)
+
+## Bulletin archive
+
+EMWIN sends tens of thousands of small text bulletins a day, and SatDump writes
+each as its own file. On drives with large clusters (exFAT especially) every
+one of them takes far more space than its length, and a folder with hundreds
+of thousands of files slows down everything that writes into it.
+
+With `--archive-bulletins`, GOESview packs each finished day's bulletins into
+one zip and removes the loose files:
+
+    <run folder>/EMWIN-archive/2026-11-18.zip
+
+- **Today's bulletins stay ordinary files.** A day is packed an hour after it
+  ends (UTC), so SatDump is never writing into anything being packed.
+- **Nothing is deleted until it is proven safe.** The zip is written to a
+  temporary file, flushed to disk, read back and compared byte for byte with
+  the originals, and moved into place. Only then do the loose files go. If
+  any step fails, they stay.
+- **Nothing changes in the viewer.** Archived bulletins are listed, shown,
+  linked and searched exactly as before.
+- **The archives are plain zip files** holding the bulletins under their
+  original names. `unzip` gets them back without GOESview.
+- **Retention covers them.** The `--satdump-*` limits treat each day's zip as
+  one unit.
+
+It is off by default, because it removes files SatDump wrote. It only works
+inside GOESview's idea of a GOES HRIT run folder (see Retention), honours
+`--satdump-protect`, touches nothing but EMWIN `.txt` bulletins, and with
+`--prune-dry-run` only reports what it would pack.
 
 ## Colour tables
 

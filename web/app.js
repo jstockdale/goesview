@@ -131,9 +131,12 @@ function liveSwitch(scroller, refresh) {
 const popup = (() => {
   const dlg = h('dialog', { class: 'popup' });
   document.body.append(dlg);
-  let list = [], at = 0, token = 0;
+  let list = [], at = 0, token = 0, onShow = null, onClose = null;
   dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });  // a click on the backdrop
+  dlg.addEventListener('close', () => { if (onClose) onClose(); });
+  addEventListener('resize', () => { if (dlg.open) place(); });
   document.addEventListener('keydown', e => {
+    if (dlg.open && e.key === 'Escape' && !dlg.matches(':modal')) return dlg.close();  // modal dialogs do this themselves
     if (!dlg.open || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
     e.preventDefault();
     step(e.key === 'ArrowLeft' ? -1 : 1);
@@ -179,10 +182,40 @@ const popup = (() => {
           h('a', { class: 'btn', href: file(item.p), target: '_blank', rel: 'noopener', text: isImage ? 'Full resolution ↗' : 'Raw ↗' }),
           h('button', { title: 'Close (Esc)', text: '✕', onclick: () => dlg.close() }))),
       body);
+    if (onShow) onShow(item);
+  }
+
+  /** On the Live page the pop-up docks over the image area and leaves the right-hand bar in
+   *  reach, so other boxes and bulletins can be clicked one after another. Anywhere else, and
+   *  on narrow screens where the page is one column, it is an ordinary modal dialog. */
+  function place() {
+    const live = $('.live'), side = live && $('.side', live);
+    const dock = !!side && innerWidth > 1100;
+    if (dlg.open && dock === dlg.matches(':modal')) dlg.close();  // switching between the two modes
+    if (dock) {
+      const a = live.getBoundingClientRect(), b = side.getBoundingClientRect();
+      Object.assign(dlg.style, { left: `${a.left + 10}px`, top: `${a.top + 10}px`,
+        width: `${b.left - a.left - 20}px`, height: `${a.height - 20}px` });
+      if (!dlg.open) dlg.show();
+    } else {
+      dlg.removeAttribute('style');
+      if (!dlg.open) dlg.showModal();
+    }
+    dlg.classList.toggle('docked', dock);
   }
 
   return {
-    open(items, index) { list = items; at = Math.max(0, index); draw(); if (!dlg.open) dlg.showModal(); },
+    /** opts.onShow(item) runs for each item shown; opts.onClose() when the pop-up goes away. */
+    open(items, index, opts = {}) {
+      const closing = onClose;
+      onShow = onClose = null;        // the previous opener's selection is cleared by its own callback
+      if (closing) closing();
+      list = items; at = Math.max(0, index);
+      onShow = opts.onShow || null;
+      draw();
+      onClose = opts.onClose || null;
+      place();
+    },
     close() { if (dlg.open) dlg.close(); },
   };
 })();
@@ -353,7 +386,7 @@ function LiveView(root) {
           h('i', { style: 'background:var(--warn)' }), 'filed under an earlier scan'));
     }
     if (s.storage) {
-      const { free, total, cache, satdump, dry, last, scope } = s.storage, gb = n => (n / 2 ** 30).toFixed(n < 100 * 2 ** 30 ? 1 : 0);
+      const { free, total, cache, satdump, dry, last, scope, archive } = s.storage, gb = n => (n / 2 ** 30).toFixed(n < 100 * 2 ** 30 ? 1 : 0);
       const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
       // Exactly which folders SatDump retention may delete from, and what it leaves alone.
       const reach = satdump && scope && h('div', { class: 'reach' },
@@ -372,6 +405,10 @@ function LiveView(root) {
         h('div', { class: 'keeps' },
           h('b', { text: 'GOESview cache' }),
           h('span', {}, cache ? cache + trial : 'kept forever', sweep(last && last.cache)),
+          archive && h('b', { text: 'Bulletins' }),
+          archive && h('span', {}, `today's are files; finished days are packed into zips${archive.dry ? ' (dry run)' : ''}`,
+            h('div', {}, `${plural(archive.days, 'day')} packed so far`),
+            archive.last && h('div', {}, `Last: ${archive.last.day}, ${archive.last.n.toLocaleString()} bulletins, ${gb(archive.last.freed)} GB of files into ${(archive.last.size / 2 ** 20).toFixed(0)} MB · `, agoEl(archive.last.t))),
           h('b', { class: satdump ? 'deletes' : '', text: 'SatDump data' }),
           h('span', {}, satdump ? `${satdump}; older data is deleted${trial}` : 'never deleted', reach, sweep(last && last.satdump))));
     }
@@ -392,7 +429,30 @@ function LiveView(root) {
       e.scrollLeft = !was || was.atEnd ? e.scrollWidth : was.left;
     }
     settle.forEach(run => run());
+    mark();
   }
+
+  // What the pop-up is showing, so the right-hand bar can mark it: a band box, or a bulletin row.
+  let picked = null;
+  function mark() {
+    for (const el of root.querySelectorAll('.sel')) el.classList.remove('sel');
+    if (!picked) return;
+    if (picked.row) { picked.row.classList.add('sel'); return; }
+    for (const strip of tele.querySelectorAll('.bandscroll')) {
+      if (strip.dataset.g !== picked.g) continue;
+      const cell = strip.querySelector(`i[data-band="${picked.band}"][data-time="${picked.t}"]`);
+      if (cell) {
+        cell.classList.add('sel');
+        if (picked.reveal) {  // once per selection: bring it into the strip's view without moving the page
+          const box = strip.getBoundingClientRect(), c = cell.getBoundingClientRect();
+          if (c.left < box.left + 26) strip.scrollLeft -= box.left + 26 - c.left;
+          else if (c.right > box.right - 4) strip.scrollLeft += c.right - box.right + 4;
+          picked.reveal = false;
+        }
+      }
+    }
+  }
+  const unpick = () => { picked = null; mark(); };
 
   // A filled box in a bands-per-scan strip opens that band's image for that scan;
   // the arrows then step through the same band over time, as the strip does.
@@ -406,15 +466,24 @@ function LiveView(root) {
     if (!d) return;
     const frames = d.frames.map(f => ({ k: 'i', ty: type.id, t: f[0], r: f[0], p: f[1], m: f[2] || undefined, n: f[3] || undefined, s: f[4] }));
     const at = frames.findIndex(f => f.t === time);
-    if (at >= 0) popup.open(frames, at);
+    if (at >= 0) popup.open(frames, at, { onShow: f => { picked = { g: group, band, t: f.t, reveal: true }; mark(); }, onClose: unpick });
   });
 
   const ticker = [];  // the bulletins on screen, newest first
   function bulletin(item, body) {
     const type = state.types.get(item.ty);
     const code = type ? type.label.slice(0, 3) : '';
-    return h('a', { class: 'row', href: textHref(item.ty, item.id),
-      onclick: e => { if (plainClick(e)) { e.preventDefault(); popup.open(ticker.slice(), ticker.indexOf(item)); } } },
+    return h('a', { class: 'row', href: textHref(item.ty, item.id), 'data-id': item.id,
+      onclick: e => {
+        if (!plainClick(e)) return;
+        e.preventDefault();
+        popup.open(ticker.slice(), ticker.indexOf(item), { onClose: unpick, onShow: shown => {
+          const row = rows.querySelector(`.row[data-id="${shown.id}"]`);
+          picked = row ? { row } : null;
+          mark();
+          if (row) row.scrollIntoView({ block: 'nearest' });
+        } });
+      } },
       h('time', { text: utc(item.t) }),
       h('span', { class: 'code' + (WARN_CODES.has(code) ? ' warn' : ''), text: code }),
       h('span', { class: 'nm', text: item.nm || (type && type.label) || '' }),
@@ -457,7 +526,7 @@ function LiveView(root) {
     },
     onTypes() { drawHero(); },
     onStats: drawStats,
-    destroy() { wallWatch.disconnect(); },
+    destroy() { wallWatch.disconnect(); picked = null; },
   };
 }
 

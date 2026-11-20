@@ -43,6 +43,7 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+import zipfile
 import zlib
 from datetime import timedelta
 from email.utils import formatdate, parsedate_to_datetime
@@ -73,6 +74,8 @@ def log(*parts):
 ANCHORS = ("IMAGES", "L2", "EMWIN", "Admin Messages")
 IMAGE_EXT = {"png", "jpg", "jpeg", "gif"}
 TEXT_EXT = {"txt"}
+ARCHIVE_DIR = "EMWIN-archive"  # in a run folder: one zip of text bulletins per finished day
+DAY_ZIP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.zip$")
 SLOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
 BAND_RE = re.compile(r"^(G\d\d|HIM)_(\w+?)_\d{8}T\d{6}Z(?:_\d+)?\.\w+$")
 COMPOSITE_RE = re.compile(r"^[a-z]+_rgb_(.+?)(_map)?\.\w+$")
@@ -196,6 +199,13 @@ def classify(parts):
 
 # -------------------------------------------------------------------- catalog
 
+def loose_twin(vpath):
+    """Where an archived bulletin ("z/<run>/EMWIN-archive/DAY.zip/NAME") sat as a loose file."""
+    head, _, name = vpath[2:].rpartition("/")
+    run = head.rsplit("/", 2)[0] + "/" if head.count("/") >= 2 else ""
+    return f"s/{run}EMWIN/{name}"
+
+
 class Item:
     __slots__ = ("id", "path", "kind", "type", "time", "recv", "size", "map", "note", "name")
 
@@ -250,6 +260,8 @@ class Catalog:
         self.pending_maps = {}
         self.slots = {}  # (section, group) -> {slot name: (dir relative to root, set of file names)}
         self.dirs = {self.root: DirState()}
+        self.zips = {}                               # open bulletin archives: path -> (mtime, ZipFile)
+        self.zip_lock = threading.Lock()
         self.ids = {}                                # item id -> item, for feed cursors
         self.recent = collections.deque(maxlen=400)  # latest live arrivals, replayed to reconnecting tabs
         self.subscribers = set()
@@ -270,6 +282,89 @@ class Catalog:
         full = os.path.realpath(os.path.join(base, *rel.split("/")))
         return full if full.startswith(base + os.sep) else None
 
+    def archive_of(self, vpath):
+        """("z/.../EMWIN-archive/DAY.zip/NAME") -> (real path of the zip, member name), or (None, None)."""
+        cut = vpath.find(".zip/")
+        if not vpath.startswith("z/") or cut < 0:
+            return None, None
+        rel, member = posixpath.normpath(vpath[2:cut + 4]), vpath[cut + 5:]
+        parts = rel.split("/")
+        if rel.startswith(("/", "..")) or len(parts) < 2 or parts[-2] != ARCHIVE_DIR or not DAY_ZIP_RE.match(parts[-1]):
+            return None, None
+        full = os.path.realpath(os.path.join(self.root, *parts))
+        return (full, member) if full.startswith(self.root + os.sep) else (None, None)
+
+    def read_bytes(self, vpath, limit=None):
+        """The contents of a text item, whether it is a loose file or packed in a day's archive."""
+        try:
+            if vpath.startswith("z/"):
+                path, member = self.archive_of(vpath)
+                if path is None:
+                    return None
+                mtime = os.stat(path).st_mtime_ns
+                with self.zip_lock:  # one reader at a time per process is plenty for small bulletins
+                    held = self.zips.get(path)
+                    if held is None or held[0] != mtime:
+                        if held:
+                            held[1].close()
+                        while len(self.zips) >= 12:
+                            self.zips.pop(next(iter(self.zips)))[1].close()
+                        held = self.zips[path] = (mtime, zipfile.ZipFile(path))
+                    data = held[1].read(member)
+                return data if limit is None else data[:limit]
+            path = self.resolve(vpath)
+            if path is None:
+                return None
+            with open(path, "rb") as f:
+                return f.read() if limit is None else f.read(limit)
+        except (OSError, KeyError, zipfile.BadZipFile):
+            return None
+
+    def repath(self, moves):
+        """Bulletins were packed: point their items at the archive. Same items, same ids."""
+        with self.lock:
+            doubled = set()
+            for old, new in moves:
+                item = self.by_path.get(old)
+                if item is None:
+                    continue
+                if new in self.by_path:  # already listed from the zip (a pack that was interrupted)
+                    doubled.add(old)
+                    continue
+                del self.by_path[old]
+                item.path = new
+                self.by_path[new] = item
+            if doubled:
+                self.forget(set(), doubled)
+
+    def members(self, prefix):
+        with self.lock:
+            return [v for v in self.by_path if v.startswith(prefix)]
+
+    def _load_archive(self, path):
+        """List a day's archive: every bulletin in it becomes an item, as if still a loose file."""
+        rel = os.path.relpath(path, self.root).replace(os.sep, "/")
+        try:
+            with zipfile.ZipFile(path) as zf:
+                names = zf.namelist()
+        except (OSError, zipfile.BadZipFile) as exc:
+            log(f"archive: cannot read {path}: {exc}")
+            return True
+        for name in names:
+            vpath = f"z/{rel}/{name}"
+            loose = loose_twin(vpath)
+            spec = classify(loose[2:].split("/"))
+            if spec is None or spec.time is None:
+                continue
+            entry = (vpath, spec, spec.time, spec.time, None, None)
+            if self._staging is not None:
+                self._staging.append(entry)
+            else:
+                with self.lock:
+                    if loose not in self.by_path:  # else the archiver is about to repoint that item
+                        self._commit(*entry, live=False)
+        return True
+
     # -- scanning
 
     def scan(self):
@@ -278,6 +373,9 @@ class Catalog:
         self._staging = []
         self._rescan(self.root, 0)
         staged, self._staging = self._staging, None
+        # A pack that was interrupted can leave a bulletin both loose and archived: list it once.
+        loose = {entry[0] for entry in staged if entry[0].startswith("s/")}
+        staged = [e for e in staged if not (e[0].startswith("z/") and loose_twin(e[0]) in loose)]
         staged.sort(key=lambda entry: entry[3])
         with self.lock:
             for entry in staged:
@@ -328,6 +426,8 @@ class Catalog:
         state.mtime = mtime
 
     def _consider(self, entry, now):
+        if DAY_ZIP_RE.match(entry.name) and os.path.basename(os.path.dirname(entry.path)) == ARCHIVE_DIR:
+            return self._load_archive(entry.path)
         rel = os.path.relpath(entry.path, self.root).replace(os.sep, "/")
         spec = classify(rel.split("/"))
         if spec is None:
@@ -819,6 +919,12 @@ class TextIndex(threading.Thread):
             try:
                 if job[0] == "add":
                     self.add(db, *job[1:])
+                elif job[0] == "move":
+                    for old, new in job[1]:
+                        try:
+                            db.execute("UPDATE files SET path = ? WHERE path = ?", (new, old))
+                        except sqlite3.IntegrityError:
+                            self.drop(db, old)  # the new path is already indexed
                 else:
                     for path in job[1]:
                         self.drop(db, path)
@@ -858,12 +964,10 @@ class TextIndex(threading.Thread):
     def add(self, db, path, recv, name):
         if db.execute("SELECT 1 FROM files WHERE path = ?", (path,)).fetchone():
             return
-        source = self.catalog.resolve(path)
-        try:
-            with open(source, "rb") as f:
-                body = CONTROL_RE.sub(" ", f.read(self.LIMIT).decode("latin-1"))
-        except (OSError, TypeError):
+        raw = self.catalog.read_bytes(path, self.LIMIT)
+        if raw is None:
             return
+        body = CONTROL_RE.sub(" ", raw.decode("latin-1"))
         # "AFDSEWWA · FXUS66 KSEW" also answers to its parts: AFD, SEW, WA
         ident = name.split(" ")[0] if name else ""
         keys = f"{name} {ident[:3]} {ident[3:6]} {ident[6:]}" if len(ident) == 8 else name
@@ -892,8 +996,9 @@ class TextIndex(threading.Thread):
         db = self.connect()
         try:
             return db.execute(
-                "SELECT rowid, path, snippet(docs, 1, char(2), char(3), ' … ', 28) FROM docs WHERE docs MATCH ?"
-                + (" AND rowid < ?" if before else "") + " ORDER BY rowid DESC LIMIT ?",
+                "SELECT docs.rowid, files.path, snippet(docs, 1, char(2), char(3), ' … ', 28)"
+                " FROM docs JOIN files ON files.id = docs.rowid WHERE docs MATCH ?"
+                + (" AND docs.rowid < ?" if before else "") + " ORDER BY docs.rowid DESC LIMIT ?",
                 (match, before, limit) if before else (match, limit)).fetchall()
         except sqlite3.OperationalError:
             return []
@@ -1253,6 +1358,14 @@ class Pruner(threading.Thread):
         for run in self.survey():
             for anchor in PRUNE_ANCHORS:
                 walk(os.path.join(run, anchor), 0)
+            try:  # packed bulletins: one unit per day, as old as that day's end
+                for entry in os.scandir(os.path.join(run, ARCHIVE_DIR)):
+                    m = DAY_ZIP_RE.match(entry.name)
+                    day = stamp(m.group(1), "%Y-%m-%d") if m and entry.is_file(follow_symlinks=False) else None
+                    if day is not None:
+                        found.append([day + 86399, None, entry.path, False])
+            except OSError:
+                pass
         if skipped != self.scope["skipped"]:
             log(f"retention, SatDump data: leaving {count(skipped, 'unrecognised item')} inside the run folders alone")
         self.scope["skipped"] = skipped
@@ -1274,7 +1387,7 @@ class Pruner(threading.Thread):
             return
         doomed = units[:cut]
         catalog, root = self.catalog, self.catalog.root
-        dead_dirs, dead_files, stale = set(), set(), []
+        dead_dirs, dead_files, stale, dead_zips = set(), set(), [], []
 
         def note_previews(vpath, path):
             if vpath.rsplit(".", 1)[-1].lower() in IMAGE_EXT:
@@ -1287,6 +1400,11 @@ class Pruner(threading.Thread):
             if not os.path.realpath(path).startswith(root + os.sep):
                 continue  # never touch anything outside the data folder
             rel = os.path.relpath(path, root).replace(os.sep, "/")
+            if not is_folder and DAY_ZIP_RE.match(os.path.basename(path)):
+                packed = catalog.members(f"z/{rel}/")  # a day of bulletins in one archive
+                dead_files.update(packed)
+                dead_zips.append(path)
+                continue
             if not is_folder:
                 dead_files.add("s/" + rel)
                 note_previews("s/" + rel, path)
@@ -1317,12 +1435,127 @@ class Pruner(threading.Thread):
         for rel in dead_dirs:
             shutil.rmtree(os.path.join(root, *rel.split("/")), ignore_errors=True)
             shutil.rmtree(os.path.join(catalog.derived_root, *rel.split("/")), ignore_errors=True)
-        for vpath in dead_files:
+        for path in dead_zips + [os.path.join(root, *v[2:].split("/")) for v in dead_files if v.startswith("s/")]:
             try:
-                os.unlink(os.path.join(root, *vpath[2:].split("/")))
+                os.unlink(path)
             except OSError:
                 pass
         catalog.publish("pruned", {"cutoff": int(doomed[-1][0]), "what": "satdump"})
+
+
+# ------------------------------------------------------------ bulletin archive
+
+class Archiver(threading.Thread):
+    """Packs each finished day's EMWIN text bulletins into one zip, then deletes the loose files.
+
+    Bulletins are tiny and there are tens of thousands a day. On a drive with large
+    clusters each one takes far more room than its length, and folders that size slow
+    down everything that writes into them, SatDump included. Today's bulletins are
+    left alone as ordinary files; once a UTC day is over (plus an hour's grace) its
+    bulletins go into <run>/EMWIN-archive/<day>.zip under their original names.
+
+    A loose file is deleted only after the archive holding it has been written to a
+    temporary file, flushed to disk, read back and compared byte for byte, and moved
+    into place. If any step fails, the loose files stay and the archive is not touched.
+    """
+    GRACE = 3600
+
+    def __init__(self, app, protect, include, dry_run):
+        super().__init__(daemon=True, name="archiver")
+        self.app, self.catalog = app, app.catalog
+        self.protect, self.include, self.dry_run = set(protect), set(include), dry_run
+        self.last = None
+        self.days = 0
+
+    def run(self):
+        time.sleep(45)  # let the first scan and its follow-up work settle
+        while True:
+            try:
+                self.sweep()
+            except Exception:
+                traceback.print_exc()
+            time.sleep(1800)
+
+    def sweep(self):
+        boundary = int(time.time() - self.GRACE) // 86400 * 86400  # start of the current UTC day
+        days = 0
+        for run in goes_runs(self.catalog.root, self.protect, self.include)[0]:
+            folder, by_day = os.path.join(run, "EMWIN"), {}
+            try:
+                entries = list(os.scandir(folder))
+            except OSError:
+                entries = []
+            for entry in entries:
+                m = EMWIN_RE.match(entry.name) if entry.name.lower().endswith(".txt") else None
+                when = stamp(m.group(3), "%Y%m%d%H%M%S") if m else None
+                if when is not None and when < boundary and not entry.is_symlink() and entry.is_file(follow_symlinks=False):
+                    by_day.setdefault(time.strftime("%Y-%m-%d", time.gmtime(when)), []).append(entry.name)
+            for day in sorted(by_day):
+                self.pack(run, day, sorted(by_day[day]))
+            try:
+                days += sum(1 for e in os.scandir(os.path.join(run, ARCHIVE_DIR)) if DAY_ZIP_RE.match(e.name))
+            except OSError:
+                pass
+        self.days = days
+
+    def pack(self, run, day, names):
+        label = f"{day} in {os.path.basename(run)}"
+        if self.dry_run:
+            log(f"archive (dry run): would pack {count(len(names), 'bulletin')} from {label}")
+            return
+        folder, out = os.path.join(run, "EMWIN"), os.path.join(run, ARCHIVE_DIR)
+        target = os.path.join(out, day + ".zip")
+        tmp = target + ".tmp"
+        started = time.time()
+        try:
+            os.makedirs(out, exist_ok=True)
+            if os.path.exists(target):
+                shutil.copyfile(target, tmp)  # late arrivals for a day already packed: extend a copy
+            elif os.path.exists(tmp):
+                os.unlink(tmp)
+            with zipfile.ZipFile(tmp, "a", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                have = set(zf.namelist())
+                for name in names:
+                    if name not in have:
+                        zf.write(os.path.join(folder, name), name)
+            with open(tmp, "rb") as f:
+                os.fsync(f.fileno())
+            with zipfile.ZipFile(tmp) as zf:  # read every bulletin back before trusting the archive
+                for name in names:
+                    with open(os.path.join(folder, name), "rb") as f:
+                        if zf.read(name) != f.read():
+                            raise ValueError(f"{name} did not read back identically")
+            os.replace(tmp, target)
+        except Exception as exc:
+            log(f"archive: {label} NOT packed, loose files left as they were: {exc}")
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return
+
+        # The archive is complete, verified and in place. Repoint the catalog, then free the space.
+        rel = os.path.relpath(run, self.catalog.root).replace(os.sep, "/")
+        prefix = "" if rel == "." else rel + "/"
+        moves = [(f"s/{prefix}EMWIN/{name}", f"z/{prefix}{ARCHIVE_DIR}/{day}.zip/{name}") for name in names]
+        self.catalog.repath(moves)
+        if self.app.text_index:
+            self.app.text_index.jobs.put(("move", moves))
+        freed = 0
+        for name in names:
+            try:
+                path = os.path.join(folder, name)
+                freed += on_disk(os.lstat(path))
+                os.unlink(path)
+            except OSError:
+                pass
+        packed = on_disk(os.lstat(target))
+        self.last = {"t": int(time.time()), "day": day, "n": len(names), "freed": freed, "size": packed}
+        log(f"archive: packed {count(len(names), 'bulletin')} from {label}: {human(freed)} of loose files "
+            f"now {human(packed)} in {ARCHIVE_DIR}/{day}.zip ({time.time() - started:.0f}s)")
+
+    def status(self):
+        return {"days": self.days, "last": self.last, "dry": self.dry_run}
 
 
 # ----------------------------------------------------------------------- http
@@ -1330,11 +1563,9 @@ class Pruner(threading.Thread):
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
-def snippet(path, limit=1400):
-    try:
-        with open(path, "rb") as f:
-            raw = f.read(limit + 1)
-    except OSError:
+def snippet(catalog, vpath, limit=1400):
+    raw = catalog.read_bytes(vpath, limit + 1)
+    if raw is None:
         return "", False
     text = CONTROL_RE.sub("", raw[:limit].decode("latin-1")).lstrip("\n")
     return text, len(raw) > limit
@@ -1359,6 +1590,8 @@ class Handler(BaseHTTPRequestHandler):
             params = dict(urllib.parse.parse_qsl(url.query))
             if path.startswith("/api/"):
                 self.api(path[5:], params)
+            elif path.startswith("/f/z/"):  # a bulletin packed into a day's archive
+                self.send_bytes(self.app.catalog.read_bytes(path[3:]), "text/plain; charset=iso-8859-1", "max-age=86400")
             elif path.startswith("/f/"):
                 self.send_file(self.app.catalog.resolve(path[3:]), "max-age=86400")
             elif path.startswith("/p/"):
@@ -1389,7 +1622,7 @@ class Handler(BaseHTTPRequestHandler):
             for item, excerpt in hits:
                 row = item.as_dict()
                 row["hit"] = excerpt
-                row["b"], row["more"] = snippet(catalog.resolve(item.path))
+                row["b"], row["more"] = snippet(catalog, item.path)
                 rows.append(row)
             body = {"items": rows, "more": more, "cursor": cursor, "index": self.app.text_index.progress()}
         elif name == "items":
@@ -1402,7 +1635,7 @@ class Handler(BaseHTTPRequestHandler):
             for item in items:
                 row = item.as_dict()
                 if item.kind == "text" and params.get("body"):
-                    row["b"], row["more"] = snippet(catalog.resolve(item.path))
+                    row["b"], row["more"] = snippet(catalog, item.path)
                 rows.append(row)
             body = {"items": rows, "more": more}
         elif name == "timeline":
@@ -1427,6 +1660,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
+
+    def send_bytes(self, data, ctype, cache):
+        if data is None:
+            return self.send_error(404)
+        start, end, status = 0, len(data) - 1, 200
+        m = re.match(r"bytes=(\d+)-(\d*)$", self.headers.get("Range", ""))
+        if m and data:
+            start = min(int(m.group(1)), len(data))
+            end = min(int(m.group(2)), end) if m.group(2) else end
+            status = 206
+        chunk = data[start:end + 1]
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(chunk)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", cache)
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{start + len(chunk) - 1}/{len(data)}")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(chunk)
 
     def send_file(self, path, cache):
         try:
@@ -1521,6 +1775,7 @@ class App:
         self.pruner = None
         self.colourist = None
         self.text_index = None
+        self.archiver = None
 
     def stats(self):
         disk = shutil.disk_usage(self.catalog.root)
@@ -1529,6 +1784,7 @@ class App:
                    "cache": pruner.cache.describe() if pruner and pruner.cache else None,
                    "satdump": pruner.satdump.describe() if pruner and pruner.satdump else None,
                    "scope": pruner.scope if pruner else None,
+                   "archive": self.archiver.status() if self.archiver else None,
                    "dry": bool(pruner and pruner.dry_run),
                    "last": pruner.last if pruner else {}}
         return {**self.catalog.stats(), "storage": storage, **self.extra}
@@ -1583,6 +1839,11 @@ def main():
                         help="when the disk is fuller than this, delete the oldest SatDump data: 90%%")
     theirs.add_argument("--satdump-protect", action="append", default=[], metavar="FOLDER",
                         help="never delete from this run folder (its name under the root); may be repeated")
+    theirs.add_argument("--archive-bulletins", action="store_true",
+                        help="pack each finished day's EMWIN text bulletins into one zip inside the run folder "
+                             f"({ARCHIVE_DIR}/DAY.zip), verify it, then delete the loose files. Nothing is lost and "
+                             "they stay viewable and searchable; it saves a great deal of space on drives with large "
+                             "clusters. Today's bulletins are left as ordinary files")
     theirs.add_argument("--satdump-include", action="append", default=[], metavar="FOLDER",
                         help="also treat this folder as a GOES HRIT run, if you named it yourself; may be repeated")
     ap.add_argument("--prune-every", type=float, default=10, metavar="MIN", help="minutes between retention sweeps (default: %(default)s)")
@@ -1650,6 +1911,13 @@ def main():
         app.pruner = Pruner(app, cache_limits, satdump_limits, args.prune_every * 60, args.prune_dry_run,
                             args.satdump_protect, args.satdump_include)
         app.pruner.start()
+
+    if args.archive_bulletins:
+        app.archiver = Archiver(app, args.satdump_protect, args.satdump_include, args.prune_dry_run)
+        app.archiver.start()
+        log(f"bulletin archive: on{dry}; finished days are packed into <run>/{ARCHIVE_DIR}/DAY.zip and the loose files deleted")
+    else:
+        log("bulletin archive: off (see --archive-bulletins)")
 
     if args.satdump_api:
         threading.Thread(target=poll_satdump, args=(args.satdump_api, app.extra), daemon=True).start()

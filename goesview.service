@@ -15,6 +15,10 @@
 # Those deletions are permanent. Try them with --prune-dry-run first and read
 # the log. See README.md.
 #
+# Bulletin archive: add --archive-bulletins to pack each finished day's EMWIN
+# text bulletins into one verified zip per day and remove the loose files.
+# Worth having on exFAT drives, where every small file takes a whole cluster.
+#
 # Install:
 #   sudo cp goesview.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
