@@ -83,7 +83,7 @@ body.kiosk #bar { height: 30px; background: transparent; border: 0; }
   scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 .side > .panel { flex: none; }
 .fold + .fold { margin-top: 11px; }
-.fold > summary { display: flex; align-items: baseline; gap: 7px; cursor: pointer; list-style: none; user-select: none;
+.fold > summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; cursor: pointer; list-style: none; user-select: none;
   font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
 .fold > summary::-webkit-details-marker { display: none; }
 .fold > summary::before { content: '▸'; width: 8px; font-size: 10px; }
@@ -92,6 +92,7 @@ body.kiosk #bar { height: 30px; background: transparent; border: 0; }
 .fold > summary:hover { color: var(--text); }
 .fold > summary .brief { margin-left: auto; font-weight: 400; letter-spacing: 0; text-transform: none; white-space: nowrap; }
 .fold[open] > summary .brief { display: none; }
+.fold > summary .pinned { flex: 1 0 100%; margin: 1px 0 0; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px; }
 .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
 .kpi { display: block; background: var(--raise); border: 1px solid transparent; border-radius: 8px; padding: 6px 8px; min-width: 0; }

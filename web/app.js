@@ -337,9 +337,11 @@ function LiveView(root) {
         s.last[sec] ? agoEl(s.last[sec]) : h('span', { class: 'dim', text: 'nothing yet' }));
     };
     // Each section folds away; the choice is remembered. `brief` is what shows while it is folded.
+    // `pinned`, if any, sits under the heading and stays visible folded or not.
     const fold = (key, title, brief, open, ...content) => {
+      const pinned = content[0] && content[0].classList && content[0].classList.contains('pinned') ? content.shift() : null;
       const el = h('details', { class: 'fold', open: store.get(`fold:${key}`, open ? '1' : '0') === '1' },
-        h('summary', {}, h('span', { text: title }), h('span', { class: 'brief' }, brief)), ...content);
+        h('summary', {}, h('span', { text: title }), h('span', { class: 'brief' }, brief), pinned), ...content);
       el.addEventListener('toggle', () => store.set(`fold:${key}`, el.open ? '1' : '0'));
       return el;
     };
@@ -409,15 +411,15 @@ function LiveView(root) {
       // Folded by default: the one line says how full the disk is and whether SatDump data can be deleted.
       const brief = [`${gb(free)} GB free`, satdump && h('span', { class: 'note', text: ' · SatDump data is pruned' })];
       parts.push(fold('storage', 'Storage', brief, false,
-        h('div', { class: 'meter', title: `${Math.round(used * 100)}% of the disk used` },
+        h('div', { class: 'meter pinned', title: `${Math.round(used * 100)}% of the disk used` },
           h('i', { class: used > 0.9 ? 'full' : '', style: `width:${(used * 100).toFixed(1)}%` })),
         h('div', { class: 'legend' }, `${gb(free)} GB free of ${gb(total)} GB`),
         h('div', { class: 'keeps' },
           h('b', { text: 'GOESview cache' }),
           h('span', {}, cache ? cache + trial : 'kept forever', sweep(last && last.cache)),
           archive && h('b', { text: 'Bulletins' }),
-          archive && h('span', {}, `today's are files; finished days are packed into zips${archive.dry ? ' (dry run)' : ''}`,
-            h('div', {}, `${plural(archive.days, 'day')} packed so far`),
+          archive && h('span', {}, `today's as files, past days zipped${archive.dry ? ' (dry run)' : ''}`,
+            h('div', {}, `${plural(archive.days, 'day')} zipped so far`),
             archive.last && h('div', {}, `Last: ${archive.last.day}, ${archive.last.n.toLocaleString()} bulletins, ${gb(archive.last.freed)} GB of files into ${(archive.last.size / 2 ** 20).toFixed(0)} MB · `, agoEl(archive.last.t))),
           h('b', { class: satdump ? 'deletes' : '', text: 'SatDump data' }),
           h('span', {}, satdump ? `${satdump}; older data is deleted${trial}` : 'never deleted', reach, sweep(last && last.satdump)))));
