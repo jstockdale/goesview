@@ -618,7 +618,6 @@ function LiveView(root) {
 
 // ------------------------------------------- section: groups, latest and feed
 
-const DIGEST = 8;  // items per group on the as-received overview
 
 function SectionView(root, section, mode) {
   const side = sidebar(section);
@@ -632,7 +631,8 @@ function SectionView(root, section, mode) {
   const grid = h('div', { class: 'grid' });
   const sentinel = h('div', { class: 'empty' });
   const watcher = new IntersectionObserver(es => es[0].isIntersecting && more(), { root: pane, rootMargin: '600px' });
-  const live = mode === 'feed' ? liveSwitch(pane, () => redraw())
+  const waiting = [];  // arrivals held back while paused, oldest first
+  const live = mode === 'feed' ? liveSwitch(pane, () => catchUp())
     : { badge: null, live: true, missed() {}, reset() {} };  // "latest of each" is always current
 
   const kinds = () => [...state.types.values()].filter(t => t.sec === section && t.kind === 'i');
@@ -663,14 +663,22 @@ function SectionView(root, section, mode) {
     ].filter(Boolean));
   }
 
+  const place = item => { const el = tile(item); grid.prepend(el); flash(el); };
+
+  /** Back to live: add what arrived meanwhile, and leave what is already on the page
+   *  (older items scrolled into included) as it is. */
+  function catchUp() {
+    for (const item of waiting.splice(0)) place(item);
+  }
+
   function redraw() {
     live.reset();
+    waiting.length = 0;
     drawBars();
     run++; before = 0; done = loading = false;
     watcher.unobserve(sentinel);
     pane.replaceChildren();
     if (mode === 'latest') drawLatest();
-    else if (overview()) drawDigest();
     else { grid.replaceChildren(); pane.append(grid, sentinel); watcher.observe(sentinel); more(); }
   }
 
@@ -686,33 +694,8 @@ function SectionView(root, section, mode) {
     if (!pane.children.length) pane.append(h('div', { class: 'empty', text: 'Nothing received yet.' }));
   }
 
-  /** As received, but each group keeps its own block rather than one mixed stream.
-   *  Each block starts with its newest few and can be extended downwards. */
-  function drawDigest() {
-    const mine = run;
-    for (const g of groups()) {
-      if (!kinds().some(t => t.grp === g && passes(t))) continue;
-      const box = h('div', { class: 'grid', 'data-grp': g });
-      const older = h('button', { class: 'more', text: 'Show older', hidden: true });
-      let cursor = 0;
-      const load = async count => {
-        older.disabled = true;
-        const d = await getJSON(`/api/items?sec=${section}&kind=i&limit=${count}&group=${encodeURIComponent(g)}${rawQuery()}`
-          + (cursor ? `&before=${cursor}` : ''));
-        if (mine !== run) return;
-        for (const item of d.items) box.append(tile(item));
-        if (d.items.length) cursor = d.items[d.items.length - 1].id;
-        older.hidden = !d.more;
-        older.disabled = false;
-      };
-      older.addEventListener('click', () => load(24));
-      pane.append(heading(g, 'open this group'), box, older);
-      load(DIGEST);
-    }
-  }
-
-  function heading(group, more) {
-    return h('h3', {}, group, overview() && h('button', { class: 'link', text: more || 'open', onclick: () => pickGroup(group) }));
+  function heading(group) {
+    return h('h3', {}, group, overview() && h('button', { class: 'link', text: 'open', onclick: () => pickGroup(group) }));
   }
 
   async function more() {
@@ -743,12 +726,9 @@ function SectionView(root, section, mode) {
         if (!old) return drawLatest();
         const el = tile(type.last); old.replaceWith(el); flash(el);
       } else if (!live.live) {
-        live.missed();  // paused: count it, move nothing
-      } else if (overview()) {
-        const box = [...pane.querySelectorAll('.grid')].find(e => e.dataset.grp === type.grp);
-        if (!box) return redraw();
-        const el = tile(item); box.prepend(el); flash(el);
-      } else { const el = tile(item); grid.prepend(el); flash(el); }
+        waiting.push(item);  // paused: count it, move nothing
+        live.missed();
+      } else place(item);
     },
     onTypes() { side.refresh(); drawBars(); if (mode === 'latest') drawLatest(); },
     destroy() { watcher.disconnect(); },
