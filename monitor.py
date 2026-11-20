@@ -227,10 +227,11 @@ class Monitor(threading.Thread):
             if "Usage :" in text or "Extra options" in text or text.startswith(" --"):
                 return  # SatDump prints its usage as errors every time it starts
             add("err" if level in ("E", "C") else "warn")
+            text = text[:300]  # what is kept, and so what a repeat has to match
             if self.messages and self.messages[-1][2] == text and t - self.messages[-1][0] < 3600:
                 self.messages[-1] = (t, level, text, self.messages[-1][3] + 1)  # the same thing again: count it
             else:
-                self.messages.append((t, level, text[:300], 1))
+                self.messages.append((t, level, text, 1))
             return
         if text.startswith("Starting SatDump"):
             self.sd.update(version=text[len("Starting SatDump"):].strip(), opened=t)
@@ -332,7 +333,8 @@ class Monitor(threading.Thread):
 
     def flush(self, now, backfill=False):
         """Save every finished minute. A minute seen only in the log (history from before GOESview
-        started) never replaces one that was sampled live."""
+        started) never replaces one that was sampled live, and a log line that turns up after its
+        minute was saved adds to that minute without wiping what is there."""
         current = int(now) // 60
         done = sorted(minute for minute in self.minutes if minute < current)
         if not done:
@@ -342,8 +344,10 @@ class Monitor(threading.Thread):
             try:  # what GOESview itself took in during those minutes
                 stats = self.app.catalog.stats()
                 for section, counts in stats["rate"].items():
+                    # The counts go by age, so the newest one covers the 60 seconds just gone: with
+                    # the flush running moments after a minute ends, that is the minute just finished.
                     for back, n in enumerate(reversed(counts)):
-                        rates.setdefault(stats["now"] // 60 - back, {})[section] = n
+                        rates.setdefault(stats["now"] // 60 - 1 - back, {})[section] = n
                 if self.app.dcs and self.app.dcs.present:
                     summary = self.app.dcs.summary()
                     for back, n in enumerate(reversed(summary["minutes"])):
@@ -367,9 +371,20 @@ class Monitor(threading.Thread):
                     if sums.get(key):
                         row[key] = sums[key]
                 row.update(rates.get(minute, {}))
-                if row:
-                    db.execute(f"INSERT OR {'IGNORE' if backfill else 'REPLACE'} INTO minutes(t, d) VALUES(?, ?)",
-                               (minute * 60, json.dumps(row, separators=(",", ":"))))
+                if not row:
+                    continue
+                if not backfill and (saved := db.execute("SELECT d FROM minutes WHERE t = ?", (minute * 60,)).fetchone()):
+                    try:  # already saved: this is a straggler from the log, so add to it
+                        late, row = row, json.loads(saved[0])
+                        for key, value in late.items():
+                            if key in ("lrit", "written", "warn", "err"):
+                                row[key] = row.get(key, 0) + value
+                            elif key in rates.get(minute, {}) or key not in row:
+                                row[key] = value
+                    except ValueError:
+                        pass
+                db.execute(f"INSERT OR {'IGNORE' if backfill else 'REPLACE'} INTO minutes(t, d) VALUES(?, ?)",
+                           (minute * 60, json.dumps(row, separators=(",", ":"))))
             db.commit()
         finally:
             db.close()
