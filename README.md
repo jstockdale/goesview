@@ -237,13 +237,15 @@ Storage.
 
 ## System monitor
 
-The **System** page answers "is everything working, and has it been?".
+The **System** page answers "is everything working, and has it been?". It
+opens from the status dot in the top right corner of every page, labelled
+System. The dot is green when all is well and turns amber or red when
+something needs a look; hovering over it says what.
 
 - **Traffic lights** for SatDump (running, reporting, locked, signal, error
   rate), for each kind of product (how long since one arrived), and for the
-  machine (disk, temperature, processor, memory, power). The System link in
-  the header carries an amber or red dot when any of them needs a look, and
-  the Live page shows the same in one line.
+  machine (disk, temperature, processor, memory, power). The Live page shows
+  the same in one line.
 - **Charts** over the last 15 minutes up to 30 days: signal to noise, Viterbi
   error rate, time in lock, files written by SatDump, arrivals in GOESview,
   DCS messages, SatDump's warnings and errors, processor, load, temperature,

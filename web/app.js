@@ -1551,6 +1551,7 @@ function route() {
   else state.view = LiveView(root);
   root.classList.toggle('flow', state.view.nav === 'live');  // the Live page stacks and scrolls as a whole in a narrow window
   for (const a of document.querySelectorAll('#nav a')) a.classList.toggle('on', a.dataset.nav === state.view.nav);
+  $('#sys').classList.toggle('on', state.view.nav === 'system');
 }
 
 async function loadTypes() {
@@ -1564,8 +1565,8 @@ const reloadTypes = debounce(async () => { await loadTypes(); if (state.view && 
 function connect() {
   const es = new EventSource('/api/events');
   const dot = $('#conn');
-  es.onopen = () => { dot.classList.add('ok'); dot.title = 'Live'; };
-  es.onerror = () => { dot.classList.remove('ok'); dot.title = 'Reconnecting…'; };
+  es.onopen = () => { dot.classList.add('ok'); describeHealth(); };
+  es.onerror = () => { dot.classList.remove('ok'); describeHealth(); };
   es.addEventListener('item', e => {
     const item = JSON.parse(e.data), type = state.types.get(item.ty);
     if (!type) {  // first item of a new type: fetch the type list, then deliver the item as usual
@@ -1588,16 +1589,23 @@ function connect() {
   es.addEventListener('stats', e => applyStats(JSON.parse(e.data)));
 }
 
+/** The dot in the header is the connection to this server and, with it, the health of everything behind
+ *  it: green, amber or red. It is also the way in to the System page. */
+function describeHealth() {
+  const link = $('#sys'), dot = $('#conn'), health = state.stats && state.stats.health, live = dot.classList.contains('ok');
+  dot.classList.toggle('warn', !!health && health.state === 'warn');
+  dot.classList.toggle('bad', !!health && health.state === 'bad');
+  $('.lbl', link).hidden = !health;
+  if (health) link.setAttribute('href', '#/system'); else link.removeAttribute('href');
+  link.title = !live ? 'Reconnecting to the server…' : health ? `${health.text}. Open the System page.` : 'Live';
+}
+
 function applyStats(s) {
   state.stats = s;
   const hour = Object.values(s.rate).flat().reduce((a, b) => a + b, 0);
   $('#rate').textContent = `${hour} items in the last hour`;
   $('#nav a[data-nav="dcs"]').hidden = !s.dcs;  // DCS shows only while SatDump is writing DCS files
-  const sys = $('#nav a[data-nav="system"]');   // the System link carries a dot when something needs a look
-  sys.hidden = !s.health;
-  sys.classList.toggle('warn', !!s.health && s.health.state === 'warn');
-  sys.classList.toggle('bad', !!s.health && s.health.state === 'bad');
-  sys.title = s.health ? s.health.text : '';
+  describeHealth();
   if (state.view && state.view.onStats) state.view.onStats(s);
 }
 

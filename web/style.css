@@ -289,9 +289,12 @@ button.link:hover { text-decoration: underline; }
 
 /* System */
 .alarm { color: var(--bad); }
-#nav a.warn::after, #nav a.bad::after { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-left: 6px;
-  background: var(--warn); vertical-align: 1px; }
-#nav a.bad::after { background: var(--bad); box-shadow: 0 0 7px var(--bad); }
+/* the header's dot: green, amber or red while connected, and the way in to the System page */
+#sys { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 6px; color: var(--dim); }
+#sys[href]:hover { color: var(--text); background: var(--raise); }
+#sys.on { color: var(--text); background: var(--raise); }
+.dot.ok.warn { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+.dot.ok.bad { background: var(--bad); box-shadow: 0 0 8px var(--bad); }
 .syslink { display: block; font-size: 12px; }
 .sys { height: 100%; padding: 12px 14px 30px; }
 .lights { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 8px; margin-bottom: 12px; }
