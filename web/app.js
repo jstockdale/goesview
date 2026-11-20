@@ -1091,6 +1091,9 @@ function fullscreen() {
 }
 document.addEventListener('fullscreenchange', () => document.body.classList.toggle('kiosk', !!document.fullscreenElement));
 $('#full').addEventListener('click', fullscreen);
+// Header links always clear the pop-up, as Esc does: a link to the page you are already on
+// changes nothing in the address, so without this it would do nothing at all.
+$('#bar').addEventListener('click', e => { if (e.target.closest('a')) popup.close(); });
 document.addEventListener('keydown', e => { if (e.key === 'f' && !/INPUT|SELECT|TEXTAREA/.test(e.target.tagName) && !e.metaKey && !e.ctrlKey) fullscreen(); });
 
 loadTypes().then(() => { route(); connect(); addEventListener('hashchange', route); })
