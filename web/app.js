@@ -414,13 +414,14 @@ function LiveView(root) {
       const verdict = !satdump ? h('span', { class: 'safe', text: 'never deleted' })
         : dry ? h('span', { class: 'safe', text: 'dry run: nothing is deleted' })
           : h('span', { class: 'note', text: 'older data is deleted' });
-      const brief = [`${gb(free)} GB free`,
-        deleting && h('span', { class: 'note', text: ' · SatDump data is pruned' }),
-        satdump && dry && h('span', { class: 'safe', text: ' · SatDump pruning: dry run' })];
+      // Folded, the heading carries the SatDump status; the bar and free space stay below it either way.
+      const brief = [deleting && h('span', { class: 'note', text: 'SatDump data is pruned' }),
+        satdump && dry && h('span', { class: 'safe', text: 'SatDump pruning: dry run' })];
       parts.push(fold('storage', 'Storage', brief, false,
-        h('div', { class: 'meter pinned', title: `${Math.round(used * 100)}% of the disk used` },
-          h('i', { class: used > 0.9 ? 'full' : '', style: `width:${(used * 100).toFixed(1)}%` })),
-        h('div', { class: 'legend' }, `${gb(free)} GB free of ${gb(total)} GB`),
+        h('div', { class: 'pinned' },
+          h('div', { class: 'meter', title: `${Math.round(used * 100)}% of the disk used` },
+            h('i', { class: used > 0.9 ? 'full' : '', style: `width:${(used * 100).toFixed(1)}%` })),
+          h('div', { class: 'legend' }, `${gb(free)} GB free of ${gb(total)} GB`)),
         h('div', { class: 'keeps' },
           h('b', { text: 'GOESview cache' }),
           h('span', {}, cache ? cache + trial : 'kept forever', sweep(last && last.cache)),

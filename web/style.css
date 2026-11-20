@@ -93,7 +93,8 @@ body.kiosk #bar { height: 30px; background: transparent; border: 0; }
 .fold > summary:hover { color: var(--text); }
 .fold > summary .brief { margin-left: auto; font-weight: 400; letter-spacing: 0; text-transform: none; white-space: nowrap; }
 .fold[open] > summary .brief { display: none; }
-.fold > summary .pinned { flex: 1 0 100%; margin: 1px 0 0; }
+.fold > summary .pinned { flex: 1 0 100%; margin: 1px 0 0; font-weight: 400; letter-spacing: 0; text-transform: none; }
+.fold > summary .pinned .legend { margin-bottom: 0; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px; }
 .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
 .kpi { display: block; background: var(--raise); border: 1px solid transparent; border-radius: 8px; padding: 6px 8px; min-width: 0; }
