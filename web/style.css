@@ -269,6 +269,7 @@ button.link:hover { text-decoration: underline; }
 .card polyline { fill: none; stroke: var(--accent); stroke-width: 1.4; vector-effect: non-scaling-stroke; }
 .kv2 { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; font-size: 12px; margin-bottom: 14px; }
 .kv2 span:nth-child(odd) { color: var(--dim); }
+.kv2 a { color: var(--accent); }
 .msg { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; overflow: hidden; background: var(--panel); }
 .msg header { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 5px 10px; background: var(--raise); font-size: 12px; align-items: baseline; }
 .msg .vals { display: flex; flex-direction: column; gap: 2px; padding: 7px 10px 0; font-size: 12px; font-variant-numeric: tabular-nums; }

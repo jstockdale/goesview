@@ -1259,7 +1259,6 @@ function DcsView(root, initial) {
       return;
     }
     const hr = s.hour, pct = (a, b) => b ? `${Math.round(100 * a / b)}%` : '–';
-    const decoded = hr.types.filter(([ty]) => ty === 'SHEF').reduce((a, [, n]) => a + n, 0);
     const tile = (label, big, small, ...rest) => h('div', { class: 'kpi still' }, h('label', { text: label }),
       h('b', { text: big }), small && h('small', { text: small }), rest);
     const busiest = Math.max(1, ...hr.channels.map(c => c[1]));
@@ -1275,7 +1274,7 @@ function DcsView(root, initial) {
           h('div', { class: 'split', title: `GOES-East ${hr.east.toLocaleString()}, GOES-West ${hr.west.toLocaleString()} in the last hour` },
             h('i', { style: `flex:${hr.east}` }), h('i', { style: `flex:${hr.west}` })),
           h('div', { class: 'dim', text: `${pct(hr.west, hr.n)} West` })),
-        tile('Decoded readings', pct(decoded, hr.n), 'of messages',
+        tile('Decoded readings', pct(hr.decoded, hr.n), 'of messages',
           h('div', { class: 'dim', text: hr.types.map(([ty, n]) => `${dcsType(ty)} ${pct(n, hr.n)}`).join(' · ') })),
         tile('Problems', hr.bad.toLocaleString(), 'flagged',
           h('div', { class: hr.bad / Math.max(1, hr.n) > 0.02 ? 'note' : 'dim', text: `${pct(hr.bad, hr.n)} of messages in the last hour` }),
@@ -1307,7 +1306,19 @@ function DcsView(root, initial) {
       const points = asc.filter(m => m[key] != null).map(m => [m.t, m[key]]);
       return points.length ? card(label, points, unit) : null;
     };
-    const about = d.dcp && Object.entries(d.dcp).filter(([, v]) => v != null && typeof v !== 'object' && String(v).trim() !== '');
+    // What SatDump knows about the station, from the tables it downloads (when it has them).
+    const k = d.dcp || {}, place = k.lat != null && k.lon != null;
+    const about = [
+      k.description && ['Station', k.description],
+      (k.agency || k.state) && ['Owner', [k.agency, k.state].filter(Boolean).join(', ')],
+      place && ['Location', h('a', { href: `https://www.openstreetmap.org/?mlat=${k.lat}&mlon=${k.lon}#map=11/${k.lat}/${k.lon}`,
+        target: '_blank', rel: 'noopener', title: 'Open a map at this spot',
+        text: `${Math.abs(k.lat).toFixed(4)}° ${k.lat >= 0 ? 'N' : 'S'}, ${Math.abs(k.lon).toFixed(4)}° ${k.lon >= 0 ? 'E' : 'W'} ↗` })],
+      k.transmit_interval && ['Transmits', `every ${k.transmit_interval} minutes`],
+      k.sensors && ['Sensors', k.sensors],
+      (k.manufacturer || k.model) && ['Transmitter', [k.manufacturer, k.model].filter(Boolean).join(' ')],
+      k.nmc_descriptor && ['NMC descriptor', k.nmc_descriptor],
+    ].filter(Boolean);
     const message = m => h('div', { class: 'msg' },
       h('header', {}, h('b', { text: utc(m.t, true) }), agoEl(m.t),
         h('span', { class: 'dim', text: `${dcsType(m.ty)} · ch ${m.ch ?? '–'} · ${DCS_SATS[m.sat] || '?'}${m.sig != null ? ` · ${m.sig.toFixed(1)} dBm` : ''}` }),
@@ -1317,13 +1328,13 @@ function DcsView(root, initial) {
     const shown = shownAll ? d.messages : d.messages.slice(0, 20);
     detail.replaceChildren(...[
       h('a', { class: 'back', href: '#/dcs', text: '← All platforms' }),
-      h('h2', {}, h('span', { class: 'addr', text: d.a.toUpperCase() }), d.nm && ` ${d.nm}`),
+      h('h2', {}, h('span', { class: 'addr', text: d.a.toUpperCase() }), k.description ? ` ${k.description}` : d.nm ? ` ${d.nm}` : null),
       h('div', { class: 'sub' },
         d.n ? `Channel ${d.ch ?? '–'} · ${DCS_SATS[d.sat] || 'satellite unknown'}${d.rate ? ` · ${d.rate} baud` : ''} · heard ${d.n.toLocaleString()} time${d.n === 1 ? '' : 's'}, first ${utc(d.first, true)}, last `
           : 'Never heard here. ', d.n ? agoEl(d.t) : null,
         d.m ? h('div', { class: 'note' }, `${d.m.toLocaleString()} missed slot${d.m === 1 ? '' : 's'} reported, the latest `, agoEl(d.mt)) : null,
         d.f & 255 ? h('div', { class: 'note', text: `Latest message flagged: ${flagNames(d.f & 255).join(', ')}` }) : null),
-      about && about.length ? h('div', { class: 'kv2' }, about.map(([k, v]) => [h('span', { text: k.replace(/_/g, ' ') }), h('span', { text: String(v) })])) : null,
+      about.length ? h('div', { class: 'kv2' }, about.flatMap(([label, value]) => [h('span', { text: label }), h('span', {}, value)])) : null,
       series.length ? h('h3', { text: `Readings${span > 1 ? `, last ${span < 48 ? `${Math.round(span)} hours` : `${(span / 24).toFixed(1)} days`}` : ''}` }) : null,
       series.length ? h('div', { class: 'cards' }, series.map(([name, points]) => card(name, points))) : null,
       d.messages.length ? h('h3', { text: 'Radio' }) : null,

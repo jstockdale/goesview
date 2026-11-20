@@ -67,20 +67,45 @@ def number(value):
     return round(float(value), 2) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+NUMBER_RE = re.compile(r"[-+]?(\d+\.?\d*|\.\d+)")
+
+
+def tidy(value):
+    """A reading as SatDump prints it ('6.830000', '03.34') without the padding."""
+    text = str(value).strip()
+    if NUMBER_RE.fullmatch(text):
+        try:
+            return f"{float(text):.4f}".rstrip("0").rstrip(".") or "0"
+        except ValueError:
+            pass
+    return text[:24]
+
+
 def platform_name(dcp):
-    """A label for a platform from whatever SatDump knows about it. SatDump fills this in from
-    NOAA's platform table when it has one; the field names are its own, so look for likely ones."""
+    """'DELAWARE RIVER AT LORDVILLE · NY · USGS01' from what SatDump knows about a platform.
+    SatDump takes this from the station tables it downloads (NOAA's PDT, and HADS)."""
     if not isinstance(dcp, dict):
         return None
-    lowered = {str(k).lower(): v for k, v in dcp.items()}
-    parts = []
-    for keys in (("description", "location", "name", "site", "station"), ("agency", "owner", "organization", "state")):
-        for key in keys:
-            value = lowered.get(key)
-            if isinstance(value, str) and value.strip():
-                parts.append(value.strip())
-                break
+    parts = [dcp.get(key).strip() for key in ("description", "state", "agency")
+             if isinstance(dcp.get(key), str) and dcp.get(key).strip()]
     return " · ".join(parts)[:200] or None
+
+
+def platform_details(dcp):
+    """The parts of SatDump's platform record worth keeping, as compact JSON."""
+    if not isinstance(dcp, dict):
+        return None
+    keep = {}
+    for key in ("description", "agency", "state", "lat", "lon", "manufacturer", "model", "nmc_descriptor", "transmit_interval"):
+        value = dcp.get(key)
+        if isinstance(value, str) and value.strip():
+            keep[key] = value.strip()[:200]
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and value not in (-1, 0):
+            keep[key] = round(value, 5)
+    sensors = [str(pe.get("name", ""))[:80] for pe in dcp.get("pe_info") or [] if isinstance(pe, dict)]
+    if sensors:
+        keep["sensors"] = ", ".join(dict.fromkeys(sensors))[:1200]
+    return json.dumps(keep, separators=(",", ":")) if keep else None
 
 
 def parse(raw, ftime):
@@ -117,7 +142,7 @@ def parse(raw, ftime):
         vals = None
         if isinstance(values, list) and values:
             vals = json.dumps([[str(v.get("name", ""))[:80], v.get("interval") or 0, v.get("reading_age") or 0,
-                                [str(x)[:24] for x in (v.get("values") or [])[:96]]]
+                                [tidy(x) for x in (v.get("values") or [])[:96]]]
                                for v in values[:40] if isinstance(v, dict)], separators=(",", ":"))
         rate = head.get("data_rate")
         dcp = block.get("dcp") if isinstance(block.get("dcp"), dict) else None
@@ -125,8 +150,7 @@ def parse(raw, ftime):
                      int(rate) if isinstance(rate, str) and rate.isdigit() else None,
                      number(head.get("signal_strength")), number(head.get("phase_noise")),
                      number(head.get("freq_offset")), flags, str(block.get("data_type") or "Unknown")[:24],
-                     str(block.get("data_ascii") or "")[:4000], vals, platform_name(dcp),
-                     json.dumps(dcp, separators=(",", ":"))[:4000] if dcp else None])
+                     str(block.get("data_ascii") or "")[:4000], vals, platform_name(dcp), platform_details(dcp)])
     shift = round((ftime - max(ends)) / 3600) * 3600 if ends else 0
     for row in rows:
         t = row[0] + shift if row[0] is not None else ftime
@@ -347,14 +371,15 @@ class DcsStore(threading.Thread):
         now = int(time.time())
         minute = now // 60
         lo = db.execute("SELECT min(lo) FROM files WHERE t >= ? AND lo IS NOT NULL", (now - 3700,)).fetchone()[0]
-        minutes, channels, types, sats, bad, total = {}, {}, {}, {1: 0, 2: 0}, 0, 0
+        minutes, channels, types, sats, bad, total, decoded = {}, {}, {}, {1: 0, 2: 0}, 0, 0, 0
         if lo is not None:
             minutes = dict(db.execute("SELECT t / 60, count(*) FROM messages WHERE id >= ? AND t >= ? GROUP BY 1",
                                       (lo, (minute - 60) * 60)))
-            for ch, sat, typ, flagged, n in db.execute(
-                    f"SELECT ch, sat, typ, (flags & {BAD}) != 0, count(*) FROM messages WHERE id >= ? AND t >= ? "
-                    "GROUP BY 1, 2, 3, 4", (lo, now - 3600)):
+            for ch, sat, typ, flagged, has_values, n in db.execute(
+                    f"SELECT ch, sat, typ, (flags & {BAD}) != 0, vals IS NOT NULL, count(*) FROM messages "
+                    "WHERE id >= ? AND t >= ? GROUP BY 1, 2, 3, 4, 5", (lo, now - 3600)):
                 total += n
+                decoded += n if has_values else 0
                 channels[ch] = channels.get(ch, 0) + n
                 types[typ] = types.get(typ, 0) + n
                 sats[sat] = sats.get(sat, 0) + n
@@ -374,6 +399,7 @@ class DcsStore(threading.Thread):
         return {
             "now": now, "rate": round(sum(recent) / len(recent)) if recent else 0, "minutes": series,
             "hour": {"n": total, "east": sats.get(1, 0), "west": sats.get(2, 0), "bad": bad, "missed": missed or 0,
+                     "decoded": decoded,
                      "types": sorted(types.items(), key=lambda kv: -kv[1]),
                      "channels": sorted((ch, n) for ch, n in channels.items() if ch is not None)},
             "heard": {"hour": hour or 0, "day": day or 0, "ever": heard or 0, "known": known or 0},
@@ -385,8 +411,8 @@ class DcsStore(threading.Thread):
     def readings(vals, limit=3):
         """'Stage 3.91 · Battery 12.4' from a message's decoded values."""
         try:
-            found = [f"{name} {values[0]}" for name, _, _, values in json.loads(vals)
-                     if values and re.fullmatch(r"[-+]?\d*\.?\d+", values[0])]
+            found = [f"{name} {tidy(values[0])}" for name, _, _, values in json.loads(vals)
+                     if values and NUMBER_RE.fullmatch(values[0].strip())]
             return " · ".join(found[:limit]) or None
         except (TypeError, ValueError):
             return None
@@ -451,7 +477,9 @@ class DcsStore(threading.Thread):
                 "rate": rate, "sig": sig, "noise": noise, "off": off, "f": flags or 0, "ty": typ, "nm": name, "dcp": details,
                 "history": self.history, "flags": list(FLAGS),
                 "messages": [{"t": t, "ch": c, "sat": s, "sig": g, "noise": z, "off": o, "f": f or 0, "ty": y, "x": x,
-                              "v": json.loads(v) if v else None} for t, c, s, g, z, o, f, y, x, v in messages]}
+                              "v": [[name, interval, age, [tidy(x) for x in values]]
+                                    for name, interval, age, values in json.loads(v)] if v else None}
+                             for t, c, s, g, z, o, f, y, x, v in messages]}
 
 
 # ------------------------------------------------------------------ archive

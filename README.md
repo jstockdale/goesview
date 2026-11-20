@@ -189,10 +189,22 @@ page appears; with no DCS files there is no DCS page, and nothing to set up.
   charted over the history kept, its signal strength, phase noise and
   frequency offset, and every message it sent.
 
-About a third of messages arrive decoded into named readings; the rest are
-shown as received. Platform names and locations appear when SatDump supplies
-them, which needs NOAA's platform table; without it platforms are known by
-their address.
+SatDump does the decoding. It downloads two station tables, NOAA's platform
+table (PDT) and the HADS definitions, and with them it names each platform,
+gives its owner and position, and decodes the binary formats (Pseudobinary B,
+C and 2, and ASCII rows and columns) as well as SHEF text. Around half of all
+messages then arrive as named readings; the rest are shown as received. A
+platform in neither table is known by its address.
+
+**If SatDump stops writing files soon after you turn Parse DCS on**, look in
+its log for `Loading PDTs...` followed by `Error loading PDT line for DCP
+processing: stoul`. SatDump 1.2.3 deadlocks there when
+`~/.config/satdump/PDTS_COMPRESSED.txt` is not a real platform table, and
+since NOAA moved that file its old address returns a "Document Moved" page.
+Quit SatDump, delete that file, set `update_interval` to `-1` under
+`plugin_settings` → `goes_support` in `~/.config/satdump/settings.json` so it
+is not fetched again, and start SatDump. The HADS table alone covers about
+18,000 stations.
 
 DCS is about a million messages a day, so GOESview reads the files once into
 a database of its own, `dcs-1.sqlite3` in the cache folder. It keeps one row
