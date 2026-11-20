@@ -443,11 +443,32 @@ class Monitor(threading.Thread):
             check("mem", "Memory", "ok" if free > 15 else "warn" if free > 7 else "bad",
                   f"{host['mem']:.0f}% used, {host['mem_free'] / 2**30:.1f} GB available of {host['mem_total'] / 2**30:.1f} GB")
         if host.get("battery") is not None:
-            level, power = host["battery"], host.get("power") or ""
-            draining = power.lower() == "discharging"
-            check("power", "Power", "bad" if draining and level < 20 else "warn" if draining else "ok",
-                  f"On battery, {level}% left" if draining else f"Mains power, battery {level}% ({power.lower() or 'state unknown'})")
+            state, text = self.power(host["battery"], host.get("power") or "", now)
+            check("power", "Power", state, text)
         return out
+
+    def power(self, level, status, now):
+        """Is the battery a worry? Only when it is really running down.
+
+        A full battery on a machine that is plugged in reports "discharging" on and off as the
+        charger tops it up, so that word alone means nothing. It counts as running down when the
+        level has dropped two points in ten minutes, or has got below 90% while discharging.
+        """
+        status = status.lower()
+        earlier = [s["battery"] for s in self.ring if s.get("battery") is not None and now - s["t"] <= 600]
+        falling = bool(earlier) and earlier[0] - level >= 2
+        if status != "discharging":
+            note = "charging" if status == "charging" else "full" if status == "full" else status or "state unknown"
+            if level < 20:
+                return "warn", f"Battery low at {level}%, {note}"
+            return "ok", f"Mains power, battery {level}% ({note})"
+        if level < 20:
+            return "bad", f"On battery and nearly empty: {level}% left"
+        if falling:
+            return "warn", f"On battery and falling: {level}%, down from {earlier[0]}% ten minutes ago"
+        if level < 90:
+            return "warn", f"On battery, {level}% left"
+        return "ok", f"On battery, {level}% and holding"
 
     def brief(self):
         """For the header: the worst state and what it is about."""
