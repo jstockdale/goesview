@@ -473,11 +473,12 @@ function LiveView(root) {
       // Amber only when SatDump's data is really being deleted; green when it is safe.
       const deleting = !!satdump && !dry;
       const verdict = !satdump ? h('span', { class: 'safe', text: 'never deleted' })
-        : dry ? h('span', { class: 'safe', text: 'dry run: nothing is deleted' })
-          : h('span', { class: 'note', text: 'older data is deleted' });
-      // Folded, the heading carries the SatDump status; the bar and free space stay below it either way.
-      const brief = [deleting && h('span', { class: 'note', text: 'SatDump data is pruned' }),
-        satdump && dry && h('span', { class: 'safe', text: 'SatDump pruning: dry run' })];
+        : dry ? h('span', { class: 'safe', text: 'dry run: nothing will be deleted' })
+          : h('span', { class: 'note', text: 'oldest data will be deleted as needed' });
+      // Folded, the heading carries the SatDump setting, which is one of two things: delete oldest, or never delete.
+      // A dry run is a third, testing-only state: limits are set but not in force.
+      const brief = deleting ? h('span', { class: 'note', text: 'SatDump pruning: delete oldest' })
+        : h('span', { class: 'safe', text: `SatDump pruning: ${satdump ? 'dry run' : 'never delete'}` });
       parts.push(fold('storage', 'Storage', brief, false,
         h('div', { class: 'pinned' },
           h('div', { class: 'meter', title: `${Math.round(used * 100)}% of the disk used` },
