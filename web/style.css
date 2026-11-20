@@ -20,6 +20,7 @@ h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .08em; 
 .scroll { overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 .ago, .dim { color: var(--dim); }
 .note { color: var(--warn); }
+.safe { color: var(--good); }
 
 /* header */
 #bar { display: flex; align-items: center; gap: 18px; height: 44px; padding: 0 14px; flex: none;

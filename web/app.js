@@ -409,7 +409,14 @@ function LiveView(root) {
       const sweep = info => info && h('div', {}, `${info.dry ? 'Would remove' : 'Last removed'} ${info.what} · `, agoEl(info.t));
       // Two kinds of files, shown apart: our own cache, and what SatDump received.
       // Folded by default: the one line says how full the disk is and whether SatDump data can be deleted.
-      const brief = [`${gb(free)} GB free`, satdump && h('span', { class: 'note', text: ' · SatDump data is pruned' })];
+      // Amber only when SatDump's data is really being deleted; green when it is safe.
+      const deleting = !!satdump && !dry;
+      const verdict = !satdump ? h('span', { class: 'safe', text: 'never deleted' })
+        : dry ? h('span', { class: 'safe', text: 'dry run: nothing is deleted' })
+          : h('span', { class: 'note', text: 'older data is deleted' });
+      const brief = [`${gb(free)} GB free`,
+        deleting && h('span', { class: 'note', text: ' · SatDump data is pruned' }),
+        satdump && dry && h('span', { class: 'safe', text: ' · SatDump pruning: dry run' })];
       parts.push(fold('storage', 'Storage', brief, false,
         h('div', { class: 'meter pinned', title: `${Math.round(used * 100)}% of the disk used` },
           h('i', { class: used > 0.9 ? 'full' : '', style: `width:${(used * 100).toFixed(1)}%` })),
@@ -421,8 +428,8 @@ function LiveView(root) {
           archive && h('span', {}, `today's as files, past days zipped${archive.dry ? ' (dry run)' : ''}`,
             h('div', {}, `${plural(archive.days, 'day')} zipped so far`),
             archive.last && h('div', {}, `Last: ${archive.last.day}, ${archive.last.n.toLocaleString()} bulletins, ${gb(archive.last.freed)} GB of files into ${(archive.last.size / 2 ** 20).toFixed(0)} MB · `, agoEl(archive.last.t))),
-          h('b', { class: satdump ? 'deletes' : '', text: 'SatDump data' }),
-          h('span', {}, satdump ? `${satdump}; older data is deleted${trial}` : 'never deleted', reach, sweep(last && last.satdump)))));
+          h('b', { class: deleting ? 'deletes' : '', text: 'SatDump data' }),
+          h('span', {}, satdump ? `${satdump}; ` : '', verdict, reach, sweep(last && last.satdump)))));
     }
     if (s.satdump) {
       const keys = Object.keys(s.satdump);
