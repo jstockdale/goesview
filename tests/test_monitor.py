@@ -1359,6 +1359,34 @@ class FlushTest(Case):
         rows = self.saved(m)
         self.assertEqual([rows[(self.minute - k) * 60]["dcs"] for k in (3, 2, 1)], [3, 4, 7])
 
+    def test_dcs_count_is_completed_at_the_next_save(self):
+        """DCS files arrive some seconds late, so a minute saved the moment it ends is short; it is topped up."""
+        dcs = FakeDcs(minutes=[0] * 59 + [500])          # the minute just ended: 500 read in so far
+        m = self.make(dcs=dcs)
+        dcs.now = int(self.now)
+        m.minutes = {self.minute - 1: {"lrit": 1}}
+        m.flush(self.now)
+        self.assertEqual(self.saved(m)[(self.minute - 1) * 60], {"lrit": 1, "dcs": 500})
+        dcs.minutes, dcs.now = [0] * 58 + [760, 510], int(self.now) + 60   # a minute on: it has all come in
+        m.minutes = {self.minute: {"lrit": 2}}
+        m.flush(self.now + 60)
+        rows = self.saved(m)
+        self.assertEqual(rows[(self.minute - 1) * 60], {"lrit": 1, "dcs": 760})
+        self.assertEqual(rows[self.minute * 60], {"lrit": 2, "dcs": 510})
+
+    def test_a_stale_dcs_summary_is_made_good_at_the_next_save(self):
+        """A summary taken just before the minute ended has nothing for that minute yet: filled in a minute later."""
+        dcs = FakeDcs(minutes=[7] * 60)
+        m = self.make(dcs=dcs)
+        dcs.now = int(self.now) - int(self.now) % 60 - 2    # two seconds before the minute turned
+        m.minutes = {self.minute - 1: {"lrit": 1}}
+        m.flush(self.now)
+        self.assertNotIn("dcs", self.saved(m)[(self.minute - 1) * 60])
+        dcs.minutes, dcs.now = [7] * 58 + [740, 300], int(self.now) + 60
+        m.minutes = {self.minute: {"lrit": 1}}
+        m.flush(self.now + 60)
+        self.assertEqual(self.saved(m)[(self.minute - 1) * 60]["dcs"], 740)
+
     def test_dcs_off_adds_nothing(self):
         """With DCS on but empty, nothing about DCS is saved."""
         dcs = FakeDcs(present=False, minutes=[5] * 60)

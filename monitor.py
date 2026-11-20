@@ -386,6 +386,20 @@ class Monitor(threading.Thread):
                         pass
                 db.execute(f"INSERT OR {'IGNORE' if backfill else 'REPLACE'} INTO minutes(t, d) VALUES(?, ?)",
                            (minute * 60, json.dumps(row, separators=(",", ":"))))
+            # A minute's arrival counts are not final when it is first saved: DCS files reach GOESview
+            # some seconds after the messages in them were sent, and the DCS summary may be a few
+            # seconds old. So the minutes just before are brought up to date each time.
+            for minute in range(current - 4, current):
+                if minute in done or minute not in rates:
+                    continue
+                if saved := db.execute("SELECT d FROM minutes WHERE t = ?", (minute * 60,)).fetchone():
+                    try:
+                        row = json.loads(saved[0])
+                    except ValueError:
+                        continue
+                    if any(row.get(key) != value for key, value in rates[minute].items()):
+                        row.update(rates[minute])
+                        db.execute("UPDATE minutes SET d = ? WHERE t = ?", (json.dumps(row, separators=(",", ":")), minute * 60))
             db.commit()
         finally:
             db.close()
