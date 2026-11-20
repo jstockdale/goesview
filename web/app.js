@@ -513,8 +513,8 @@ function LiveView(root) {
         h('a', { class: `syslink ${tone}`, href: '#/system', title: 'Open the System page' }, s.health.text, h('span', { class: 'dim', text: '  Open the System page →' }))));
     }
     if (s.dcs) {
-      const storageAt = parts.findIndex(part => part.dataset.key === 'storage');  // DCS sits just above Storage
-      parts.splice(storageAt < 0 ? parts.length : storageAt, 0, fold('dcs', 'DCS', `${s.dcs.rate.toLocaleString()} messages / min`, false,
+      const after = parts.findIndex(part => part.dataset.key === 'reception');  // DCS sits just below Reception
+      parts.splice(after + 1, 0, fold('dcs', 'DCS', `${s.dcs.rate.toLocaleString()} messages / min`, false,
         h('div', { class: 'kpis two' },
           h('a', { class: 'kpi', href: '#/dcs', title: 'Open the DCS page' }, h('label', { text: 'Messages' }),
             h('b', { text: s.dcs.rate.toLocaleString() }), h('small', { text: '/ min' }),
