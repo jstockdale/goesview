@@ -132,8 +132,33 @@ const popup = (() => {
   const dlg = h('dialog', { class: 'popup' });
   document.body.append(dlg);
   let list = [], at = 0, token = 0, onShow = null, onClose = null;
+  const zoom = { s: 1, x: 0, y: 0 };  // kept while stepping, so one spot can be compared across frames
   dlg.addEventListener('click', e => { if (e.target === dlg) dlg.close(); });  // a click on the backdrop
-  dlg.addEventListener('close', () => { if (onClose) onClose(); });
+  // The wheel (or a finger) belongs to the pop-up while it is open: it zooms an image or scrolls
+  // a bulletin, and never reaches the page underneath. A modal dialog does not stop that by
+  // itself: the wheel over its backdrop, or over content with nothing left to scroll, moves the
+  // page. The page is otherwise left alone, so it is where it was when the pop-up closes.
+  function guard(e) {
+    const inside = dlg.contains(e.target);
+    if (!inside && !dlg.matches(':modal')) return;  // docked: the rest of the page works as usual
+    const text = inside && e.target.closest('.text .body');
+    if (text) {
+      const room = e.type !== 'wheel' ? text.scrollHeight > text.clientHeight + 1
+        : e.deltaY > 0 ? text.scrollTop + text.clientHeight < text.scrollHeight - 1 : text.scrollTop > 0;
+      if (room) return;  // this one scrolls the bulletin
+    }
+    e.preventDefault();
+  }
+  const guarded = on => {  // only while open: a blocking wheel listener costs every scroll a little
+    for (const kind of ['wheel', 'touchmove']) {
+      document[on ? 'addEventListener' : 'removeEventListener'](kind, guard, { passive: false, capture: true });
+    }
+  };
+  dlg.addEventListener('close', () => {
+    if (dlg.open) return;  // it was only switching between docked and modal
+    guarded(false);
+    if (onClose) onClose();
+  });
   addEventListener('resize', () => { if (dlg.open) place(); });
   document.addEventListener('keydown', e => {
     if (dlg.open && e.key === 'Escape' && !dlg.matches(':modal')) return dlg.close();  // modal dialogs do this themselves
@@ -149,11 +174,45 @@ const popup = (() => {
     const [code, desc] = !isImage && type ? type.label.split(' · ') : ['', ''];
     const body = h('div', { class: 'body' });
     if (isImage) {
-      const img = h('img', { alt: '', src: preview(item.p, 960) });  // already cached; sharpen when ready
-      const sharp = new Image();
-      sharp.onload = () => { if (mine === token) img.src = sharp.src; };
-      sharp.src = preview(item.p, 1920);
-      body.append(img);
+      const img = h('img', { alt: '', draggable: 'false', src: preview(item.p, 960) });  // already cached; sharpen when ready
+      const level = h('button', { class: 'zoomlevel', title: 'Reset zoom (double-click the image)', hidden: true });
+      body.append(img, level);
+      body.title = 'Scroll to zoom, drag to move, double-click to reset';
+      // Load the smallest version that is sharp at the current zoom: the big preview, or the original.
+      const sharpen = () => {
+        const px = Math.min(body.clientWidth, body.clientHeight) * zoom.s * (window.devicePixelRatio || 1);
+        const url = px <= 2300 ? preview(item.p, 1920) : file(item.p);
+        if (img.dataset.url === url) return;
+        const next = new Image();
+        next.onload = () => { if (mine === token) { img.src = url; img.dataset.url = url; } };
+        next.src = url;
+      };
+      const sharpenSoon = debounce(sharpen, 250);
+      const place = () => {
+        const w = body.clientWidth, ht = body.clientHeight;
+        zoom.x = clamp(zoom.x, w - w * zoom.s, 0); zoom.y = clamp(zoom.y, ht - ht * zoom.s, 0);
+        img.style.transform = zoom.s === 1 ? '' : `translate(${zoom.x}px, ${zoom.y}px) scale(${zoom.s})`;
+        body.classList.toggle('zoomed', zoom.s > 1);
+        level.hidden = zoom.s === 1;
+        level.textContent = `${zoom.s.toFixed(1)}× · reset`;
+      };
+      const reset = () => { zoom.s = 1; zoom.x = zoom.y = 0; place(); sharpenSoon(); };
+      level.addEventListener('click', reset);
+      body.addEventListener('dblclick', reset);
+      body.addEventListener('wheel', e => {
+        const r = body.getBoundingClientRect(), cx = e.clientX - r.left, cy = e.clientY - r.top;
+        const to = clamp(zoom.s * Math.exp(-e.deltaY * 0.0016), 1, 16);
+        zoom.x = cx - (cx - zoom.x) * to / zoom.s; zoom.y = cy - (cy - zoom.y) * to / zoom.s; zoom.s = to;
+        place(); sharpenSoon();
+      }, { passive: true });
+      let grab = null;
+      body.addEventListener('pointerdown', e => {
+        if (zoom.s === 1 || e.target === level) return;
+        grab = { x: e.clientX - zoom.x, y: e.clientY - zoom.y }; body.setPointerCapture(e.pointerId);
+      });
+      body.addEventListener('pointermove', e => { if (grab) { zoom.x = e.clientX - grab.x; zoom.y = e.clientY - grab.y; place(); } });
+      body.addEventListener('pointerup', () => { grab = null; });
+      requestAnimationFrame(() => { place(); sharpen(); });  // once it is in the page and has a size
     } else {
       const pre = h('pre', { text: 'Loading…' });
       fetch(file(item.p)).then(r => r.text()).then(t => { if (mine === token) pre.textContent = clean(t); })
@@ -211,10 +270,12 @@ const popup = (() => {
       onShow = onClose = null;        // the previous opener's selection is cleared by its own callback
       if (closing) closing();
       list = items; at = Math.max(0, index);
+      zoom.s = 1; zoom.x = zoom.y = 0;
       onShow = opts.onShow || null;
       draw();
       onClose = opts.onClose || null;
       place();
+      guarded(true);
     },
     close() { if (dlg.open) dlg.close(); },
   };
@@ -501,7 +562,11 @@ function LiveView(root) {
           const row = rows.querySelector(`.row[data-id="${shown.id}"]`);
           picked = row ? { row } : null;
           mark();
-          if (row) row.scrollIntoView({ block: 'nearest' });
+          if (row) {  // keep it in view within the list, without moving the page itself
+            const box = rows.getBoundingClientRect(), r = row.getBoundingClientRect();
+            if (r.top < box.top) rows.scrollTop -= box.top - r.top;
+            else if (r.bottom > box.bottom) rows.scrollTop += r.bottom - box.bottom;
+          }
         } });
       } },
       h('time', { text: utc(item.t) }),

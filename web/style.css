@@ -169,8 +169,13 @@ dialog.popup.docked { position: fixed; margin: 0; z-index: 30; box-shadow: 0 10p
 .popup .line .grp { color: var(--accent); }
 .popup .line.sub { font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
 .popup .body { flex: 1; min-height: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
-.popup.image .body { background: #000; overflow: hidden; }
-.popup .body img { display: block; width: 100%; height: 100%; object-fit: scale-down; }
+.popup.image .body { background: #000; overflow: hidden; position: relative; touch-action: none; }
+.popup.image .body.zoomed { cursor: grab; }
+.popup.image .body.zoomed:active { cursor: grabbing; }
+.popup .body { overscroll-behavior: contain; }
+.popup .zoomlevel { position: absolute; right: 10px; bottom: 10px; padding: 2px 9px; font-size: 11px; border-radius: 999px;
+  background: rgba(0, 0, 0, .65); color: var(--text); }
+.popup .body img { display: block; width: 100%; height: 100%; object-fit: scale-down; transform-origin: 0 0; user-select: none; -webkit-user-drag: none; }
 .popup .body pre { margin: 0; padding: 14px 16px; font: 13px/1.45 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 760px) {
   .popup header { grid-template-columns: minmax(0, 1fr) auto; row-gap: 6px; }
