@@ -711,7 +711,7 @@ function SectionView(root, section, mode) {
     sentinel.textContent = done ? (grid.children.length ? 'That is everything.' : 'Nothing received yet.') : 'Loading…';
     loading = false;
     // A page may not fill a tall screen, and the observer only fires when visibility changes.
-    if (!done && sentinel.getBoundingClientRect().top < pane.getBoundingClientRect().bottom + 600) more();
+    if (!done && sentinel.getBoundingClientRect().top < Math.min(pane.getBoundingClientRect().bottom, innerHeight) + 600) more();
   }
 
   redraw();
@@ -1055,7 +1055,7 @@ function TextView(root, typeId, focusId) {
       ? ` The search index is still being built (${d.index.total ? Math.round(100 * d.index.done / d.index.total) : 0}%), so older bulletins may be missing for now.` : '';
     sentinel.textContent = (done ? (feed.children.length ? 'That is everything.' : 'Nothing matches.') : 'Loading…') + building;
     loading = false;
-    if (!done && sentinel.getBoundingClientRect().top < pane.getBoundingClientRect().bottom + 800) more();
+    if (!done && sentinel.getBoundingClientRect().top < Math.min(pane.getBoundingClientRect().bottom, innerHeight) + 800) more();
   }
   function reset() {
     run++; before = 0; done = loading = false;
@@ -1098,6 +1098,7 @@ function route() {
   else if (page === 'type') state.view = Viewer(root, arg, +extra || 0);
   else if (page === 'text') state.view = TextView(root, arg || null, +extra || 0);
   else state.view = LiveView(root);
+  root.classList.toggle('flow', state.view.nav === 'live');  // the Live page stacks and scrolls as a whole in a narrow window
   for (const a of document.querySelectorAll('#nav a')) a.classList.toggle('on', a.dataset.nav === state.view.nav);
 }
 

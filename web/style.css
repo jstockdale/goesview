@@ -249,7 +249,9 @@ button.link:hover { text-decoration: underline; }
 
 @media (max-width: 1100px) {
   body { overflow: auto; }
-  #view { min-height: auto; }
+  /* Only the Live page stacks and lets the whole page scroll. The other pages keep the window's height, so
+     their lists stay their own scrollers: loading more on scroll and pausing the live feed depend on that. */
+  #view.flow { min-height: auto; }
   .live { height: auto; grid-template-columns: 1fr; grid-template-rows: none; }
   .hero { aspect-ratio: 1; }
   .wallscroll { max-height: 80vh; }
@@ -259,7 +261,8 @@ button.link:hover { text-decoration: underline; }
   #bar { gap: 8px; padding: 0 8px; }
   #rate, #clock { display: none; }
   #nav a { padding: 6px 7px; }
-  .section { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(70vh, 1fr); height: auto; }
+  /* On a very short screen the page scrolls instead of squeezing the list away. */
+  .section { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); min-height: 460px; }
   .types { display: flex; gap: 4px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 6px; }
   .types h3 { margin: 0 4px; align-self: center; white-space: nowrap; }
   .types a { white-space: nowrap; }
