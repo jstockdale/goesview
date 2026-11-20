@@ -1196,7 +1196,7 @@ function dcsMap(onPick) {
   const span = h('select', { title: 'Which platforms to show', onchange: () => { store.set('dcs:maphours', span.value); load(); } },
     [['1', 'Heard in the last hour'], ['24', 'Heard in the last day'], ['', 'Everything kept']].map(([v, label]) =>
       h('option', { value: v, text: label, selected: v === store.get('dcs:maphours', '24') })));
-  const zoomBy = f => { view.k = clamp(view.k * f, 2, 4000); draw(); };
+  const zoomBy = f => { view.k = clamp(view.k * f, widest(), 4000); draw(); };
   const el = h('div', { class: 'dmap' }, canvas, tip,
     h('div', { class: 'mapbar' }, span,
       h('button', { title: 'Zoom in', text: '+', onclick: () => zoomBy(1.6) }),
@@ -1207,6 +1207,7 @@ function dcsMap(onPick) {
   // Mercator, in degrees: x is longitude, y stretches towards the poles.
   const my = lat => Math.log(Math.tan(Math.PI / 4 + clamp(lat, -84, 84) * Math.PI / 360)) * 180 / Math.PI;
   const view = { x: -96, y: my(36), k: 8 };  // centre and pixels per degree
+  const widest = () => Math.max(0.5, Math.min(w / 360, hgt / (2 * my(84))) * 0.96);  // far enough out to see the whole world
   let points = [], selected = null, hover = null, fitted = false, names = new Map(), w = 0, hgt = 0;
   const sx = lon => (lon - view.x) * view.k + w / 2, sy = lat => (view.y - my(lat)) * view.k + hgt / 2;
 
@@ -1216,7 +1217,7 @@ function dcsMap(onPick) {
     const cut = a => [a[Math.floor(a.length * 0.01)], a[Math.ceil(a.length * 0.99) - 1]];  // ignore the odd stray
     const [x0, x1] = cut(xs), [y0, y1] = cut(ys);
     view.x = (x0 + x1) / 2; view.y = (y0 + y1) / 2;
-    view.k = clamp(Math.min(w / Math.max(4, x1 - x0), hgt / Math.max(4, y1 - y0)) * 0.9, 2, 4000);
+    view.k = clamp(Math.min(w / Math.max(4, x1 - x0), hgt / Math.max(4, y1 - y0)) * 0.9, widest(), 4000);
   }
 
   function draw() {
@@ -1225,6 +1226,10 @@ function dcsMap(onPick) {
     if (!w || !hgt) return;
     if (canvas.width !== w * dpr || canvas.height !== hgt * dpr) { canvas.width = w * dpr; canvas.height = hgt * dpr; }
     if (!fitted && points.length) { fitted = true; fit(); }
+    // Keep the world in the frame: centred once it all fits, and never dragged off the edge.
+    const halfW = w / (2 * view.k), halfH = hgt / (2 * view.k), top = my(84);
+    view.x = halfW >= 180 ? 0 : clamp(view.x, -180 + halfW, 180 - halfW);
+    view.y = halfH >= top ? 0 : clamp(view.y, -top + halfH, top - halfH);
     const g = canvas.getContext('2d'), css = getComputedStyle(document.documentElement), colour = name => css.getPropertyValue(name).trim();
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.fillStyle = colour('--bg'); g.fillRect(0, 0, w, hgt);
@@ -1309,7 +1314,7 @@ function dcsMap(onPick) {
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
     const box = canvas.getBoundingClientRect(), px = e.clientX - box.left - w / 2, py = e.clientY - box.top - hgt / 2;
-    const before = view.k, k = clamp(before * Math.exp(-e.deltaY * 0.0015), 2, 4000);
+    const before = view.k, k = clamp(before * Math.exp(-e.deltaY * 0.0015), widest(), 4000);
     view.x += px / before - px / k; view.y -= py / before - py / k;  // keep the spot under the cursor where it is
     view.k = k; draw();
   }, { passive: false });
