@@ -1155,20 +1155,20 @@ def goes_runs(root, protect=(), include=()):
 
     def holds_goes(path):
         try:
-            return any(GOES_DIR_RE.match(e.name) and e.is_dir(follow_symlinks=False)
-                       for e in os.scandir(os.path.join(path, "IMAGES")))
+            with os.scandir(os.path.join(path, "IMAGES")) as entries:
+                return any(GOES_DIR_RE.match(e.name) and e.is_dir(follow_symlinks=False) for e in entries)
         except OSError:
             return False
 
     if has_data(root) and (RUN_NAME_RE.search(os.path.basename(root)) or holds_goes(root)):
-        return [root], [], []
+        return ([], [root], []) if os.path.basename(root) in protect else ([root], [], [])
     runs, protected, others = [], [], []
     try:
         entries = sorted(os.scandir(root), key=lambda e: e.name)
     except OSError:
         return runs, protected, others
     for entry in entries:
-        named = RUN_NAME_RE.search(entry.name) or entry.name in include
+        named = (RUN_NAME_RE.search(entry.name) or entry.name in include) and not entry.name.startswith(".")
         if named and not entry.is_symlink() and entry.is_dir(follow_symlinks=False) and has_data(entry.path):
             (protected if entry.name in protect else runs).append(entry.path)
         elif not entry.name.startswith("."):
@@ -1467,8 +1467,13 @@ class Pruner(threading.Thread):
 
         for run in self.survey():
             for anchor in PRUNE_ANCHORS:
+                if os.path.islink(os.path.join(run, anchor)):
+                    skipped += 1  # a link leads somewhere that is not this run: whatever is there is not ours
+                    continue
                 walk(os.path.join(run, anchor), 0)
             try:  # packed bulletins: one unit per day, as old as that day's end
+                if os.path.islink(os.path.join(run, ARCHIVE_DIR)):
+                    raise OSError("a link, not this run's own archive folder")
                 for entry in os.scandir(os.path.join(run, ARCHIVE_DIR)):
                     m = DAY_ZIP_RE.match(entry.name)
                     day = stamp(m.group(1), "%Y-%m-%d") if m and entry.is_file(follow_symlinks=False) else None
@@ -1621,7 +1626,10 @@ class Archiver(threading.Thread):
         for run in goes_runs(self.catalog.root, self.protect, self.include)[0]:
             folder, by_day = os.path.join(run, "EMWIN"), {}
             try:
-                entries = list(os.scandir(folder))
+                # A link leads out of the run, perhaps out of the data folder altogether: nothing behind
+                # one is packed or removed, and nothing is written through one.
+                linked = os.path.islink(folder) or os.path.islink(os.path.join(run, ARCHIVE_DIR))
+                entries = [] if linked else list(os.scandir(folder))
             except OSError:
                 entries = []
             for entry in entries:

@@ -1,0 +1,24 @@
+# Runs the test suite on every push and pull request.
+# Twice per Python version: with numpy and Pillow, and without them, because GOESview is meant
+# to keep serving (minus previews and false colour) when they are not installed.
+name: tests
+on: [push, pull_request]
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+        extras: ["", "numpy Pillow"]
+    name: Python ${{ matrix.python }}${{ matrix.extras && ' with numpy and Pillow' || ' bare' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install numpy and Pillow
+        if: matrix.extras != ''
+        run: python -m pip install ${{ matrix.extras }}
+      - name: Run the tests
+        run: python -m unittest discover -s tests -v

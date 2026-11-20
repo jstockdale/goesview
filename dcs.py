@@ -897,7 +897,9 @@ class DcsArchiver(threading.Thread):
         for run in self.runs():
             by_day = {}
             try:
-                entries = list(os.scandir(os.path.join(run, DCS_DIR)))
+                # A link leads out of the run: nothing behind one is packed or removed.
+                linked = os.path.islink(os.path.join(run, DCS_DIR)) or os.path.islink(os.path.join(run, DCS_ARCHIVE_DIR))
+                entries = [] if linked else list(os.scandir(os.path.join(run, DCS_DIR)))
             except OSError:
                 entries = []
             for entry in entries:
@@ -975,6 +977,8 @@ def retention_units(runs):
     found = []
     for run in runs:
         try:
+            if os.path.islink(os.path.join(run, DCS_DIR)):
+                raise OSError("a link, not this run's own folder")
             for entry in os.scandir(os.path.join(run, DCS_DIR)):
                 when = file_time(entry.name)
                 if when is not None and not entry.is_symlink() and entry.is_file(follow_symlinks=False):
@@ -982,6 +986,8 @@ def retention_units(runs):
         except OSError:
             pass
         try:
+            if os.path.islink(os.path.join(run, DCS_ARCHIVE_DIR)):
+                raise OSError("a link, not this run's own folder")
             for entry in os.scandir(os.path.join(run, DCS_ARCHIVE_DIR)):
                 m = DAY_ZIP_RE.match(entry.name)
                 if m and not entry.is_symlink() and entry.is_file(follow_symlinks=False):

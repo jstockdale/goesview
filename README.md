@@ -348,6 +348,22 @@ Without `--dry-run` it writes `abi_rgb_ABI_False_Color_usradioguy.png` into
 each slot folder SatDump left without a colour image. `--all` builds every
 slot; `--lut learn` copies whatever colours your SatDump already produces.
 
+## Tests
+
+    python3 -m unittest discover -s tests
+
+The suite needs nothing beyond the standard library; tests that need numpy or
+Pillow are skipped without them. It builds small SatDump-shaped folders in a
+temporary directory and checks, among other things, the promises that matter
+most: that nothing SatDump wrote is deleted unless a `--satdump-*` option
+asks for it, that retention and the archives never reach beyond GOES HRIT
+run folders or SatDump's own file names, that an archive is verified before
+anything is removed, and that the DCS decoders read what they claim to. The
+same suite runs on GitHub for every push, on Python 3.11 and 3.13, with and
+without numpy and Pillow.
+
+The web page itself (`web/app.js`) has no automated tests.
+
 ## Notes
 
 Written against SatDump 1.2 output from GOES-18 HRIT (which also relays

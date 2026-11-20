@@ -41,7 +41,7 @@ ORDER = {"ok": 0, "off": 0, "warn": 1, "bad": 2}
 
 def read(path):
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             return f.read()
     except OSError:
         return None
@@ -177,7 +177,8 @@ class Monitor(threading.Thread):
                 self.sd, self.live = {"params": {}}, {}
                 if path:
                     try:
-                        self.file = open(path, "r", errors="replace")
+                        # UTF-8 whatever the locale says: under a Latin-1 locale every byte "decodes"
+                        self.file = open(path, "r", encoding="utf-8", errors="replace")
                         size = os.path.getsize(path)
                         self.skew = self.clock_skew(path, size)
                         if size > 40 << 20:  # a very long run: the recent part is plenty

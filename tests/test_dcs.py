@@ -617,6 +617,31 @@ class Retention(StoreCase):
         self.assertEqual([u[0] for u in units[1:]], [t, t + 3600])
         self.assertTrue(all(u[1] is None and u[3] is False for u in units))
 
+    def test_a_linked_dcs_folder_is_never_followed(self):
+        """<run>/DCS as a link leads out of the run: nothing behind it may be packed or deleted."""
+        elsewhere = os.path.join(self.dir.name, "elsewhere")
+        os.makedirs(elsewhere)
+        t = self.now - 3 * 86400
+        outside = touch(os.path.join(elsewhere, name_for(t)), "{}")
+        os.rmdir(os.path.join(self.run_folder, "DCS"))
+        os.symlink(elsewhere, os.path.join(self.run_folder, "DCS"))
+        self.assertEqual(dcs.retention_units([self.run_folder]), [])
+        dcs.DcsArchiver(lambda: [self.run_folder], False, self.logged.append, lambda st: st.st_size).sweep()
+        self.assertTrue(os.path.exists(outside))
+        self.assertFalse(os.path.exists(os.path.join(self.run_folder, dcs.DCS_ARCHIVE_DIR)))
+
+    def test_a_linked_archive_folder_is_never_followed(self):
+        elsewhere = os.path.join(self.dir.name, "elsewhere")
+        os.makedirs(elsewhere)
+        theirs = touch(os.path.join(elsewhere, "2026-11-01.zip"))
+        os.symlink(elsewhere, os.path.join(self.run_folder, dcs.DCS_ARCHIVE_DIR))
+        t = self.now - 3 * 86400
+        loose = self.write(t, [message("16876222", "x", t)])
+        self.assertEqual([u[2] for u in dcs.retention_units([self.run_folder])], [loose])
+        dcs.DcsArchiver(lambda: [self.run_folder], False, self.logged.append, lambda st: st.st_size).sweep()
+        self.assertTrue(os.path.exists(loose))     # nothing is written through the link, so nothing is removed
+        self.assertEqual(os.listdir(elsewhere), [os.path.basename(theirs)])
+
     def test_a_run_without_dcs_offers_nothing(self):
         self.assertEqual(dcs.retention_units([os.path.join(self.dir.name, "nowhere")]), [])
 
