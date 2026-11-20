@@ -1794,6 +1794,8 @@ class Handler(BaseHTTPRequestHandler):
                                        min(int(params.get("limit", 100)), 500), max(int(params.get("offset", 0)), 0))
             elif name == "dcs/platform":
                 body = store.platform(params.get("a", ""))
+            elif name == "dcs/map":
+                body = store.map(min(float(params["hours"]), 24 * 366) if params.get("hours") else None)
             else:
                 body = None
         else:
@@ -2037,6 +2039,11 @@ def main():
                                 f"({dcs.DCS_ARCHIVE_DIR}/DAY.zip), verify it, then delete the loose files. A day is "
                                 "some 24,000 files; packed it takes about a ninth of the space. Today's files are "
                                 "left as they are")
+    dcs_group.add_argument("--dcs-stations", metavar="WHERE", default="off",
+                           help="where to get NOAA's platform table (names, owners and positions of every DCS "
+                                "platform), for the platforms SatDump does not describe and for the map: \"noaa\" "
+                                f"fetches it once a day from {dcs.PDT_URL}; or give another address, or a file you "
+                                "downloaded. Default: off, and GOESview makes no requests of its own")
     dcs_group.add_argument("--no-dcs", action="store_true", help="do not read DCS files at all: no DCS page")
     ap.add_argument("--prune-every", type=float, default=10, metavar="MIN", help="minutes between retention sweeps (default: %(default)s)")
     ap.add_argument("--prune-dry-run", action="store_true", help="log what retention would delete, delete nothing")
@@ -2125,8 +2132,10 @@ def main():
         try:
             os.makedirs(args.cache, exist_ok=True)
             # reading is harmless, so protected runs are read too; packing and deleting honour --satdump-protect
+            stations = {"off": None, "none": None, "noaa": dcs.PDT_URL}.get(args.dcs_stations.lower(), args.dcs_stations)
             app.dcs = dcs.DcsStore(args.cache, lambda: goes_runs(catalog.root, (), args.satdump_include)[0],
-                                   args.dcs_history, log)
+                                   args.dcs_history, log, stations)
+            log(f"DCS platform table: {stations or 'off (see --dcs-stations)'}")
             app.dcs.start()
         except Exception as exc:
             log(f"DCS unavailable ({exc})")

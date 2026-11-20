@@ -28,6 +28,7 @@ import sqlite3
 import threading
 import time
 import traceback
+import urllib.request
 import zipfile
 
 DCS_DIR = "DCS"
@@ -35,6 +36,10 @@ DCS_ARCHIVE_DIR = "DCS-archive"  # in a run folder: one zip of DCS files per fin
 FILE_RE = re.compile(r"^pH-(\d{2})(\d{3})(\d{2})(\d{2})(\d{2})-\w+\.dcs\.json$", re.I)
 DAY_ZIP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.zip$")
 HEX_RE = re.compile(r"^[0-9a-fA-F]{1,8}$")
+
+# NOAA's Platform Description Table: every DCS platform, with its owner, a description and where it
+# is. Since late 2026 it is served here (the old dcs1.noaa.gov address only redirects to a web page).
+PDT_URL = "https://dadds-dcs-api.data.nesdis.noaa.gov/pdts/PDTS_COMPRESSED.txt"
 
 # Header flags, as bits. The first eight mean something went wrong with the message.
 FLAGS = ("parity_errors", "no_eot", "timing_error", "unexpected_message", "wrong_channel",
@@ -90,6 +95,43 @@ def platform_name(dcp):
     parts = [dcp.get(key).strip() for key in ("description", "state", "agency")
              if isinstance(dcp.get(key), str) and dcp.get(key).strip()]
     return " · ".join(parts)[:200] or None
+
+
+def position(lat, lon):
+    """(lat, lon) if that is a real place, else (None, None). 0,0 is how "unknown" is written."""
+    if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) and not isinstance(lat, bool) \
+            and -90 <= lat <= 90 and -180 <= lon <= 180 and (abs(lat) > 0.001 or abs(lon) > 0.001):
+        return round(lat, 5), round(lon, 5)
+    return None, None
+
+
+def read_pdt(path):
+    """NOAA's platform table as {address: (label, details as JSON, lat, lon)}.
+
+    Fixed-width text, one platform per line: agency [0:6], address [6:14], state [43:45],
+    description [47:78], latitude [78:85] and longitude [85:93] in ten-thousandths of a degree,
+    transmitter maker [94:108] and model [108:124].
+    """
+    found = {}
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            address = line[6:14]
+            if len(line) < 94 or not HEX_RE.match(address) or len(address) != 8:
+                continue
+            try:
+                lat, lon = position(int(line[78:85]) / 1e4, int(line[85:93]) / 1e4)
+            except ValueError:
+                lat = lon = None
+            keep = {"description": line[47:78].strip(), "agency": line[0:6].strip(), "state": line[43:45].strip(),
+                    "manufacturer": line[94:108].strip(), "model": line[108:124].strip()}
+            keep = {k: v for k, v in keep.items() if v and v.upper() != "UNKNOWN"}
+            if lat is not None:
+                keep["lat"], keep["lon"] = lat, lon
+            if keep:
+                keep["source"] = "NOAA platform table"
+                label = " · ".join(keep[k] for k in ("description", "state", "agency") if k in keep)[:200]
+                found[int(address, 16)] = (label or None, json.dumps(keep, separators=(",", ":")), lat, lon)
+    return found
 
 
 def platform_details(dcp):
@@ -151,9 +193,19 @@ def labelled(text):
     return out[:40] or None
 
 
+def close(values):
+    """Readings near enough to each other to be one sensor over time."""
+    return max(values) - min(values) <= max(0.3, 0.08 * max(abs(v) for v in values))
+
+
 def table(text, sensors):
-    """A message that is nothing but numbers. Lines of equal length are readings over time, one
-    column per sensor; otherwise each line is taken as one sensor."""
+    """A message that is nothing but numbers.
+
+    Lines that share a width of two or more are readings over time, one column per sensor.
+    A line on its own is one sensor with its readings. Several single-number lines are one
+    sensor each (a weather station's list), unless they sit close together, in which case they
+    are one sensor over time.
+    """
     lines = [line.strip() for line in text.replace("\r", "").split("\n") if line.strip()]
     rows = []
     for line in lines:
@@ -162,20 +214,71 @@ def table(text, sensors):
             rows.append([tidy(t) for t in tokens])
     if not rows or len(rows) < 0.6 * len(lines) or sum(len(r) for r in rows) < 2:
         return None
-    if len({len(r) for r in rows}) == 1:
-        groups, word = [[row[i] for row in rows] for i in range(len(rows[0]))], "Column"
+    widths = {}
+    for row in rows:
+        widths[len(row)] = widths.get(len(row), 0) + 1
+    wide = max((w for w, n in widths.items() if w >= 2 and (n >= 2 or len(rows) == 1)),
+               key=lambda w: (widths[w], w), default=None)
+    singles = [i for i, row in enumerate(rows) if len(row) == 1]
+    series = len(singles) >= 3 and close([float(rows[i][0]) for i in singles])
+    # A line one longer than the rest carries the table's values plus one more (often the battery).
+    extras = [r[wide] for r in rows if wide and len(r) == wide + 1 and widths.get(wide + 1, 0) < widths[wide]]
+    if extras:
+        block = [r[:wide] for r in rows if len(r) in (wide, wide + 1)]
     else:
-        groups, word = rows, "Line"
-    if len(groups) > 40:
+        block = [r for r in rows if len(r) == wide]
+    # Which way round? Readings of one sensor over time vary little; readings of different sensors
+    # do not. Take the reading of the table in which the sensors come out steadier.
+    def spread(groups):
+        return sum((max(g) - min(g)) / (max(abs(v) for v in g) + 0.01) for g in groups) / len(groups)
+    by_row = False
+    if wide and len(block) >= 2:
+        numbers = [[float(v) for v in r] for r in block]
+        by_row = spread(numbers) < spread([list(c) for c in zip(*numbers)])
+    groups, columns_done, series_done = [], False, False
+    for i, row in enumerate(rows):
+        if wide and (len(row) == wide or (extras and len(row) == wide + 1)):
+            if not columns_done:
+                columns_done = True
+                if by_row:
+                    groups += [(f"Line {j + 1}", list(r)) for j, r in enumerate(block)]
+                else:
+                    groups += [(f"Column {c + 1}", [r[c] for r in block]) for c in range(wide)]
+                if extras:
+                    groups.append(("Last value", extras))
+        elif len(row) == 1 and series:
+            if not series_done:
+                series_done = True
+                run = [rows[j][0] for j in singles]
+                groups.append((f"Lines {singles[0] + 1} to {singles[-1] + 1}", run))
+        elif len(row) == 2 and series and not wide and close([float(rows[j][0]) for j in singles] + [float(row[0])]):
+            # the same single-sensor list, with one more value tacked on the end of this line
+            if not series_done:
+                series_done = True
+                run = [rows[j][0] for j in singles]
+                groups.append((f"Lines {singles[0] + 1} to {singles[-1] + 1}", run))
+            run.append(row[0])
+            groups.append(("Last value", [row[1]]))
+        else:
+            groups.append((f"Line {i + 1}", row))
+    if not groups or len(groups) > 40:
         return None
     named = len(sensors) == len(groups)
-    return [[sensors[i][0] if named else f"{word} {i + 1}", 0, 0, values[:96]] for i, values in enumerate(groups)]
+    return [[sensors[i][0] if named else name, 0, 0, values[:96]] for i, (name, values) in enumerate(groups)]
 
 
 def coherent(values):
     """Do these look like one sensor's readings? Close together, allowing for a slow trend."""
     seen = [v for v in values if v is not None]
     return not seen or max(seen) - min(seen) <= max(30, 0.08 * max(abs(v) for v in seen))
+
+
+def follows(before, after):
+    """Could `after` be the same sensor carrying on from `before`? One sensor moves in small steps;
+    a different sensor usually starts somewhere else entirely."""
+    a = next((v for v in reversed(before) if v is not None), None)
+    b = next((v for v in after if v is not None), None)
+    return a is None or b is None or abs(a - b) <= max(25, 0.05 * max(abs(a), abs(b)))
 
 
 def pseudobinary_b(text, sensors):
@@ -192,11 +295,15 @@ def pseudobinary_b(text, sensors):
     if len(body) < 6 or body[0] != "B" or not ("1" <= body[1] <= "4" or (body[1] in "CS" and len(body) >= 9)):
         return None
     data = body[3:]
-    if any(not ("?" <= c <= "\x7f" or c == "/") for c in data) or len(data) % 3 == 2:
+    if len(data) % 3 == 2:
         return None
     battery = data[-1] if len(data) % 3 == 1 else None
     if battery:
         data = data[:-1]
+        if not "+" <= battery <= "\x7f":
+            return None
+    if any(not ("?" <= c <= "\x7f" or c == "/") for c in data):
+        return None
     readings = []
     for i in range(0, len(data), 3):
         chunk = data[i:i + 3]
@@ -208,14 +315,31 @@ def pseudobinary_b(text, sensors):
     count = len(readings)
     if not count or count > 400 or all(r is None for r in readings):
         return None
-    # Sensors one after another, each with as many readings as it has: cut wherever the next
-    # reading no longer fits with the run so far.
-    groups = [[readings[0]]]
-    for reading in readings[1:]:
-        if coherent(groups[-1] + [reading]):
-            groups[-1].append(reading)
+    # Sensors one after another. Most stations send the same number of readings per sensor, so
+    # first look for a block size at which the big jumps fall between blocks and not inside
+    # them. That keeps a lively sensor (wind, temperature) in one piece.
+    jumps = [abs(a - b) if a is not None and b is not None else 0 for a, b in zip(readings, readings[1:])]
+    scores = {}
+    for size in range(2, count):
+        if count % size or count // size > 24:
+            continue
+        inside = [j for i, j in enumerate(jumps) if (i + 1) % size]
+        edges = [j for i, j in enumerate(jumps) if (i + 1) % size == 0]
+        scores[size] = (sum(edges) / len(edges)) / (sum(inside) / len(inside) + 1)
+    best = max(scores.values(), default=0)
+    if best >= 4:
+        size = max(s for s, score in scores.items() if score >= 0.8 * best)
+        blocks = [readings[i:i + size] for i in range(0, count, size)]
+    else:
+        blocks = [[r] for r in readings]
+    # Then join neighbours that agree: a sensor with more readings than the others, or, with no
+    # block size found, plain runs of readings that sit together.
+    groups = [list(blocks[0])]
+    for block in blocks[1:]:
+        if follows(groups[-1], block):
+            groups[-1] += block
         else:
-            groups.append([reading])
+            groups.append(list(block))
     # Sensors with similar values (two river stages, say) pass as one run when they are really
     # taking turns. That shows as a repeating pattern: every k-th reading agrees far better than
     # the readings do as a whole.
@@ -245,7 +369,8 @@ def pseudobinary_b(text, sensors):
             [f"{v / 100:.2f}".rstrip("0").rstrip(".") if v is not None else "" for v in group][:96]]
            for i, group in enumerate(groups)]
     if battery:  # SatDump's formulas: the first is Sutron's own, the second it worked out for the BC kind
-        volts = (ord(battery) & 63) * 0.234 + 10.6 if standard else (ord(battery) & 63) * 0.313 + 0.285
+        level = 63 if battery == "?" else ord(battery) - 64
+        volts = level * 0.234 + 10.6 if standard else level * 0.313 + 0.285
         out.append([BATTERY, 0, age, [f"{volts:.2f}"]])
     return out
 
@@ -270,7 +395,7 @@ def fallback(text, dcp):
 def parse(raw, ftime):
     """One SatDump DCS file to (messages, missed).
 
-    A message is (t, addr, ch, sat, rate, sig, noise, off, flags, typ, txt, vals, name, dcp).
+    A message is (t, addr, ch, sat, rate, sig, noise, off, flags, typ, txt, vals, name, dcp, lat, lon).
     The times SatDump prints have been seen a whole hour away from the file's own name, so
     they are shifted by whatever whole number of hours lines the newest of them up with it.
     """
@@ -312,7 +437,8 @@ def parse(raw, ftime):
                      int(rate) if isinstance(rate, str) and rate.isdigit() else None,
                      number(head.get("signal_strength")), number(head.get("phase_noise")),
                      number(head.get("freq_offset")), flags, kind,
-                     str(block.get("data_ascii") or "")[:4000], vals, platform_name(dcp), platform_details(dcp)])
+                     str(block.get("data_ascii") or "")[:4000], vals, platform_name(dcp), platform_details(dcp),
+                     *position((dcp or {}).get("lat"), (dcp or {}).get("lon"))])
     shift = round((ftime - max(ends)) / 3600) * 3600 if ends else 0
     for row in rows:
         t = row[0] + shift if row[0] is not None else ftime
@@ -323,10 +449,13 @@ def parse(raw, ftime):
 class DcsStore(threading.Thread):
     """Reads SatDump's DCS files into the database and answers the DCS page's questions."""
 
-    def __init__(self, folder, runs, history, log):
+    def __init__(self, folder, runs, history, log, stations=None):
         super().__init__(daemon=True, name="dcs")
-        self.path = os.path.join(folder, "dcs-2.sqlite3")
-        for stale in glob.glob(os.path.join(folder, "dcs-1.sqlite3*")):  # the previous layout: rebuilt from the files
+        self.folder = folder
+        self.stations_from = stations  # None, a file, or an address to fetch NOAA's platform table from
+        self.stations, self.stations_stamp, self.stations_checked = {}, None, 0
+        self.path = os.path.join(folder, "dcs-3.sqlite3")
+        for stale in glob.glob(os.path.join(folder, "dcs-[12].sqlite3*")):  # earlier layouts: rebuilt from the files
             try:
                 os.unlink(stale)
             except OSError:
@@ -349,7 +478,8 @@ class DcsStore(threading.Thread):
             CREATE INDEX IF NOT EXISTS messages_addr ON messages(addr, t);
             CREATE TABLE IF NOT EXISTS platforms(addr INTEGER PRIMARY KEY, first INTEGER, last INTEGER, n INTEGER,
                 missed INTEGER DEFAULT 0, missed_at INTEGER, ch INTEGER, sat INTEGER, rate INTEGER, sig REAL,
-                noise REAL, off REAL, flags INTEGER, typ TEXT, txt TEXT, vals TEXT, name TEXT, dcp TEXT);
+                noise REAL, off REAL, flags INTEGER, typ TEXT, txt TEXT, vals TEXT, name TEXT, dcp TEXT,
+                lat REAL, lon REAL);
             CREATE INDEX IF NOT EXISTS platforms_last ON platforms(last);
             CREATE TABLE IF NOT EXISTS hours(h INTEGER PRIMARY KEY, n INTEGER, east INTEGER, west INTEGER,
                 bad INTEGER, missed INTEGER, decoded INTEGER, files INTEGER);
@@ -374,6 +504,8 @@ class DcsStore(threading.Thread):
             started = time.time()
             busy = False
             try:
+                if time.time() - self.stations_checked > 3600:
+                    self.load_stations(db)
                 busy = self.sweep(db)
                 if time.time() - self.trimmed > 600:
                     self.trim(db)
@@ -385,6 +517,55 @@ class DcsStore(threading.Thread):
                     pass
             # A folder holding a great many files is slow to list: look less often then.
             time.sleep(0.2 if busy else max(5, min(120, 10 * (time.time() - started))))
+
+    def load_stations(self, db):
+        """Take in NOAA's platform table, fetching a fresh copy once a day if asked to, and give
+        every platform that SatDump did not describe its name and position from it."""
+        self.stations_checked = time.time()
+        source = self.stations_from
+        if not source:
+            return
+        path = source
+        if source.startswith(("http://", "https://")):
+            path = os.path.join(self.folder, "dcs-platforms.txt")
+            try:
+                fresh = time.time() - os.path.getmtime(path) < 86400
+            except OSError:
+                fresh = False
+            if not fresh:
+                try:
+                    request = urllib.request.Request(source, headers={"User-Agent": "GOESview"})
+                    with urllib.request.urlopen(request, timeout=60) as response:
+                        data = response.read(64 << 20)
+                    lines = data.split(b"\n")
+                    if sum(1 for line in lines if len(line) >= 94 and HEX_RE.match(line[6:14].decode("ascii", "replace"))) < 1000:
+                        raise ValueError("that is not a platform table")
+                    with open(path + ".tmp", "wb") as f:
+                        f.write(data)
+                    os.replace(path + ".tmp", path)
+                    self.log(f"DCS: fetched NOAA's platform table, {len(data) / 2**20:.1f} MB")
+                except Exception as exc:
+                    self.log(f"DCS: could not fetch the platform table from {source}: {exc}")
+        try:
+            stamp = os.path.getmtime(path)
+        except OSError:
+            return
+        if stamp == self.stations_stamp:
+            return
+        try:
+            self.stations = read_pdt(path)
+        except OSError as exc:
+            self.log(f"DCS: cannot read the platform table {path}: {exc}")
+            return
+        self.stations_stamp = stamp
+        filled = 0
+        for (addr,) in db.execute("SELECT addr FROM platforms WHERE dcp IS NULL").fetchall():
+            known = self.stations.get(addr)
+            if known:
+                db.execute("UPDATE platforms SET name = ?, dcp = ?, lat = ?, lon = ? WHERE addr = ?", (*known, addr))
+                filled += 1
+        db.commit()
+        self.log(f"DCS: platform table loaded, {len(self.stations):,} platforms" + (f"; named {filled:,} already heard" if filled else ""))
 
     def sweep(self, db):
         """Read what is new. Returns True if there is more waiting than one pass took."""
@@ -468,7 +649,9 @@ class DcsStore(threading.Thread):
         cur = db.cursor()
         lo = hi = None
         east = west = bad = decoded = 0
-        for t, addr, ch, sat, rate, sig, noise, off, flags, typ, txt, vals, label, dcp in rows:
+        for t, addr, ch, sat, rate, sig, noise, off, flags, typ, txt, vals, label, dcp, lat, lon in rows:
+            if dcp is None and (known := self.stations.get(addr)):  # SatDump said nothing: ask NOAA's table
+                label, dcp, lat, lon = known
             cur.execute("INSERT INTO messages(t, addr, ch, sat, rate, sig, noise, off, flags, typ, txt, vals) "
                         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (t, addr, ch, sat, rate, sig, noise, off, flags, typ, txt, vals))
             hi = cur.lastrowid
@@ -482,9 +665,9 @@ class DcsStore(threading.Thread):
             if not cur.rowcount:
                 cur.execute("INSERT INTO platforms(addr, first, last, n) VALUES(?, ?, 0, 1)", (addr, t))
             cur.execute("UPDATE platforms SET last = ?, ch = ?, sat = ?, rate = ?, sig = ?, noise = ?, off = ?, flags = ?, "
-                        "typ = ?, txt = ?, vals = ?, name = COALESCE(?, name), dcp = COALESCE(?, dcp) "
-                        "WHERE addr = ? AND last <= ?",
-                        (t, ch, sat, rate, sig, noise, off, flags, typ, txt[:600], vals, label, dcp, addr, t))
+                        "typ = ?, txt = ?, vals = ?, name = COALESCE(?, name), dcp = COALESCE(?, dcp), "
+                        "lat = COALESCE(?, lat), lon = COALESCE(?, lon) WHERE addr = ? AND last <= ?",
+                        (t, ch, sat, rate, sig, noise, off, flags, typ, txt[:600], vals, label, dcp, lat, lon, addr, t))
         for addr, ch, sat in missed:  # a platform that did not transmit in its slot
             cur.execute("INSERT OR IGNORE INTO platforms(addr, last, n, ch, sat) VALUES(?, 0, 0, ?, ?)", (addr, ch, sat))
             cur.execute("UPDATE platforms SET missed = missed + 1, missed_at = ? WHERE addr = ?", (ftime, addr))
@@ -572,7 +755,8 @@ class DcsStore(threading.Thread):
                      "channels": sorted((ch, n) for ch, n in channels.items() if ch is not None)},
             "heard": {"hour": hour or 0, "day": day or 0, "ever": heard or 0, "known": known or 0},
             "hours": hours, "last": last, "first": first,
-            "store": {"history": self.history, "size": size, "files": files, "pending": self.pending},
+            "store": {"history": self.history, "size": size, "files": files, "pending": self.pending,
+                      "stations": len(self.stations)},
         }
 
     @staticmethod
@@ -623,6 +807,30 @@ class DcsStore(threading.Thread):
                 "f": flags or 0, "ty": typ, "x": txt, "v": self.readings(vals), "nm": name}
                for addr, last, n, missed, ch, sat, rate, sig, flags, typ, txt, vals, name in rows[:limit]]
         return {"items": out, "more": len(rows) > limit, "count": count}
+
+    def map(self, hours=None):
+        """Every platform heard that has a position: [address, lat, lon, last heard, kind], where
+        kind is 3 decoded by SatDump, 2 inferred, 1 plain text, 0 undecoded."""
+        with self.lock:
+            when, key, value = getattr(self, "map_cache", (0, None, None))
+            if value is not None and key == hours and time.time() - when < 20:
+                return value
+            now = int(time.time())
+            db = self.connect()
+            try:
+                rows = db.execute("SELECT addr, lat, lon, last, typ, vals IS NOT NULL FROM platforms "
+                                  "WHERE n > 0 AND lat IS NOT NULL AND lon IS NOT NULL AND last >= ? ORDER BY last",
+                                  (now - int(hours * 3600) if hours else 0,)).fetchall()
+                placed, heard = db.execute("SELECT sum(lat IS NOT NULL), count(*) FROM platforms WHERE n > 0 AND last >= ?",
+                                           (now - int(hours * 3600) if hours else 0,)).fetchone()
+            finally:
+                db.close()
+            points = [[f"{addr:08x}", lat, lon, last,
+                       (2 if (typ or "").endswith(INFERRED) else 3) if decoded else (1 if typ == "ASCII" else 0)]
+                      for addr, lat, lon, last, typ, decoded in rows]
+            value = {"now": now, "points": points, "placed": placed or 0, "heard": heard or 0}
+            self.map_cache = (time.time(), hours, value)
+            return value
 
     def platform(self, address, limit=600):
         if not HEX_RE.match(address or ""):

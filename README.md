@@ -188,6 +188,9 @@ page appears; with no DCS files there is no DCS page, and nothing to set up.
 - **Platforms**: one row per platform, searchable by address or by the text of
   its latest message, filtered to those with decoded readings, plain text,
   undecoded binary, flagged messages or missed slots.
+- **Map**: every platform heard that has a known position, coloured by how
+  readable its messages are. Pan, zoom, point at one for its name, click it
+  for its page. The coastlines ship with GOESview; no map service is called.
 - **One platform**: its readings (river stage, rainfall, battery and so on)
   charted over the history kept, its signal strength, phase noise and
   frequency offset, and every message it sent.
@@ -206,9 +209,19 @@ of what is left, from their shape alone, and marks them **inferred**:
 - **Number tables**: a message that is only numbers, in rows and columns.
 - **Labelled text**: `:PRS 1 #1 3048 2993 :BAT 12.1`.
 - **Sutron Pseudobinary B**: readings of three characters each. The message
-  does not say how many sensors it has; GOESview groups consecutive readings
-  that sit close together into one sensor, or takes them as interleaved if
-  that needs fewer sensors. Values assume two decimal places, as SatDump does.
+  does not say how many sensors it has. GOESview looks for the block size at
+  which the big jumps fall between blocks, joins neighbouring blocks that
+  carry on from each other, and recognises sensors that take turns. Values
+  assume two decimal places, as SatDump does.
+
+How good is the inference? It can be scored on the messages SatDump *does*
+decode, by hiding the station's sensor list from GOESview and comparing. On
+8,429 Pseudobinary B messages: 79% came out identical, and the battery value
+matched in 99.5%. In a further 10% SatDump's own split cuts a sensor in two
+across an obvious jump (its sensor list does not fit the message) and
+GOESview's does not. In 8% two sensors with near-identical readings, such as
+a primary and a backup river gauge, came out as one: nothing in the message
+can tell those apart. On 2,115 number tables, 98% came out identical.
 
 That brings roughly three messages in four to readable numbers that can be
 charted. What inference cannot supply is meaning: such readings are called
@@ -227,7 +240,7 @@ is not fetched again, and start SatDump. The HADS table alone covers about
 18,000 stations.
 
 DCS is about a million messages a day, so GOESview reads the files once into
-a database of its own, `dcs-2.sqlite3` in the cache folder. It keeps one row
+a database of its own, `dcs-3.sqlite3` in the cache folder. It keeps one row
 per platform for good and every message for `--dcs-history` (3 days by
 default, about 300 MB a day). That database is GOESview's own and can be
 deleted; it is rebuilt from whatever DCS files are still on disk.
@@ -242,7 +255,20 @@ touches them. They have two options of their own, both off unless given:
 | `--satdump-dcs-keep AGE` | `15d` | **Permanently delete** SatDump's DCS files, loose or packed, older than this. |
 | `--satdump-dcs-max-size SIZE` | `20G` | Keep SatDump's DCS files under this size, deleting the oldest. |
 | `--dcs-history AGE` | `7d` | How far back GOESview's own database keeps every message. |
+| `--dcs-stations WHERE` | `noaa` | Use NOAA's platform table for names and positions (see below). Off by default. |
 | `--no-dcs` | | Do not read DCS files at all. |
+
+**Names and positions for every platform.** SatDump names a platform only
+if it is in the HADS table, which covers about 18,000 of them, mostly in the
+United States. NOAA's own platform table lists all 43,000, with owner,
+description and position. `--dcs-stations noaa` has GOESview fetch it once a
+day from NOAA (about 10 MB, kept in the cache folder) and use it for every
+platform SatDump does not describe; the map then covers nearly everything
+heard. It is off by default so that GOESview makes no requests of its own
+unless asked. You can also give a file you downloaded yourself. The table
+moved in late 2026 to
+`https://dadds-dcs-api.data.nesdis.noaa.gov/pdts/PDTS_COMPRESSED.txt`; the
+old `dcs1.noaa.gov` address now only redirects to a web page.
 
 The archive works as it does for bulletins: today's files stay as they are, a
 day is packed an hour after it ends (UTC), and nothing is removed until the
@@ -331,5 +357,8 @@ other SatDump pipelines will show up as generic image types.
 ## Credits
 
 Made by [@jstockdale](https://github.com/jstockdale) and Off by One, Inc.
+
+The DCS map's coastlines and borders are from [Natural Earth](https://www.naturalearthdata.com/),
+public domain.
 
 BSD-3-Clause licensed. Not affiliated with SatDump, NOAA or usradioguy.com.

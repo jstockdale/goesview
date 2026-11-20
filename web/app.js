@@ -404,6 +404,7 @@ function LiveView(root) {
       const el = h('details', { class: 'fold', open: store.get(`fold:${key}`, open ? '1' : '0') === '1' },
         h('summary', {}, h('span', { text: title }), h('span', { class: 'brief' }, brief), pinned), ...content);
       el.addEventListener('toggle', () => store.set(`fold:${key}`, el.open ? '1' : '0'));
+      el.dataset.key = key;
       return el;
     };
     const hourly = Object.values(s.rate).flat().reduce((a, b) => a + b, 0);
@@ -507,11 +508,13 @@ function LiveView(root) {
     }
     if (s.health) {
       const tone = { ok: 'safe', warn: 'note', bad: 'alarm' }[s.health.state];
-      parts.push(fold('system', 'System', h('span', { class: tone, text: s.health.state === 'ok' ? 'everything is working' : `${s.health.n} to look at` }), false,
+      // first in the bar: if something is wrong, that is what to see before anything else
+      parts.unshift(fold('system', 'System', h('span', { class: tone, text: s.health.state === 'ok' ? 'everything is working' : `${s.health.n} to look at` }), false,
         h('a', { class: `syslink ${tone}`, href: '#/system', title: 'Open the System page' }, s.health.text, h('span', { class: 'dim', text: '  Open the System page →' }))));
     }
     if (s.dcs) {
-      parts.push(fold('dcs', 'DCS', `${s.dcs.rate.toLocaleString()} messages / min`, false,
+      const storageAt = parts.findIndex(part => part.dataset.key === 'storage');  // DCS sits just above Storage
+      parts.splice(storageAt < 0 ? parts.length : storageAt, 0, fold('dcs', 'DCS', `${s.dcs.rate.toLocaleString()} messages / min`, false,
         h('div', { class: 'kpis two' },
           h('a', { class: 'kpi', href: '#/dcs', title: 'Open the DCS page' }, h('label', { text: 'Messages' }),
             h('b', { text: s.dcs.rate.toLocaleString() }), h('small', { text: '/ min' }),
@@ -1183,9 +1186,158 @@ function dcsSeries(messages) {
   return [...sensors].map(([name, points]) => [name, [...points].sort((a, b) => a[0] - b[0])]);
 }
 
+/** A map of the platforms heard that have a known position. Coastlines and borders come from
+ *  Natural Earth (public domain), shipped with the page: nothing is fetched from anywhere else. */
+let dcsBasemap = null;
+const DCS_KINDS = [['undecoded', '--faint'], ['plain text', '--dim'], ['inferred', '--accent'], ['decoded', '--good']];
+function dcsMap(onPick) {
+  const canvas = h('canvas'), tip = h('div', { class: 'maptip', hidden: true });
+  const note = h('span', { class: 'dim' });
+  const span = h('select', { title: 'Which platforms to show', onchange: () => { store.set('dcs:maphours', span.value); load(); } },
+    [['1', 'Heard in the last hour'], ['24', 'Heard in the last day'], ['', 'Everything kept']].map(([v, label]) =>
+      h('option', { value: v, text: label, selected: v === store.get('dcs:maphours', '24') })));
+  const zoomBy = f => { view.k = clamp(view.k * f, 2, 4000); draw(); };
+  const el = h('div', { class: 'dmap' }, canvas, tip,
+    h('div', { class: 'mapbar' }, span,
+      h('button', { title: 'Zoom in', text: '+', onclick: () => zoomBy(1.6) }),
+      h('button', { title: 'Zoom out', text: '−', onclick: () => zoomBy(1 / 1.6) }),
+      h('button', { title: 'Show every platform', text: 'Fit', onclick: () => { fit(); draw(); } })),
+    h('div', { class: 'mapkey' }, DCS_KINDS.slice().reverse().map(([name, colour]) =>
+      h('span', {}, h('i', { style: `background:var(${colour})` }), name)), note));
+  // Mercator, in degrees: x is longitude, y stretches towards the poles.
+  const my = lat => Math.log(Math.tan(Math.PI / 4 + clamp(lat, -84, 84) * Math.PI / 360)) * 180 / Math.PI;
+  const view = { x: -96, y: my(36), k: 8 };  // centre and pixels per degree
+  let points = [], selected = null, hover = null, fitted = false, names = new Map(), w = 0, hgt = 0;
+  const sx = lon => (lon - view.x) * view.k + w / 2, sy = lat => (view.y - my(lat)) * view.k + hgt / 2;
+
+  function fit() {
+    if (!points.length || !w) return;
+    const xs = points.map(p => p[2]).sort((a, b) => a - b), ys = points.map(p => my(p[1])).sort((a, b) => a - b);
+    const cut = a => [a[Math.floor(a.length * 0.01)], a[Math.ceil(a.length * 0.99) - 1]];  // ignore the odd stray
+    const [x0, x1] = cut(xs), [y0, y1] = cut(ys);
+    view.x = (x0 + x1) / 2; view.y = (y0 + y1) / 2;
+    view.k = clamp(Math.min(w / Math.max(4, x1 - x0), hgt / Math.max(4, y1 - y0)) * 0.9, 2, 4000);
+  }
+
+  function draw() {
+    const box = el.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    w = Math.round(box.width); hgt = Math.round(box.height);
+    if (!w || !hgt) return;
+    if (canvas.width !== w * dpr || canvas.height !== hgt * dpr) { canvas.width = w * dpr; canvas.height = hgt * dpr; }
+    if (!fitted && points.length) { fitted = true; fit(); }
+    const g = canvas.getContext('2d'), css = getComputedStyle(document.documentElement), colour = name => css.getPropertyValue(name).trim();
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.fillStyle = colour('--bg'); g.fillRect(0, 0, w, hgt);
+    if (dcsBasemap) {
+      for (const [key, tone, width] of [['states', '--line', 1], ['borders', '--faint', 1], ['coast', '--dim', 1.1]]) {
+        if (key === 'states' && view.k < 9) continue;  // state lines only once there is room for them
+        g.strokeStyle = colour(tone); g.lineWidth = width; g.beginPath();
+        for (const line of dcsBasemap[key]) {
+          for (let i = 0; i < line.length; i += 2) {
+            const x = sx(line[i] / 100), y = sy(line[i + 1] / 100);
+            if (i) g.lineTo(x, y); else g.moveTo(x, y);
+          }
+        }
+        g.stroke();
+      }
+    }
+    const size = view.k > 40 ? 5 : view.k > 12 ? 4 : 3, fresh = now() - 3600;
+    for (const kind of [0, 1, 2, 3]) {  // the readable ones on top
+      g.fillStyle = colour(DCS_KINDS[kind][1]);
+      for (const p of points) {
+        if (p[4] !== kind) continue;
+        const x = sx(p[2]), y = sy(p[1]);
+        if (x < -4 || y < -4 || x > w + 4 || y > hgt + 4) continue;
+        g.globalAlpha = p[3] >= fresh ? 1 : 0.5;  // not heard in the last hour: fainter
+        g.fillRect(x - size / 2, y - size / 2, size, size);
+      }
+    }
+    g.globalAlpha = 1;
+    for (const [p, tone] of [[points.find(q => q[0] === selected), '#fff'], [hover, colour('--text')]]) {
+      if (!p) continue;
+      g.strokeStyle = tone; g.lineWidth = 1.5; g.beginPath(); g.arc(sx(p[2]), sy(p[1]), size + 3, 0, 2 * Math.PI); g.stroke();
+    }
+  }
+
+  function nearest(px, py) {
+    let best = null, reach = 9 * 9;
+    for (const p of points) {
+      const dx = sx(p[2]) - px, dy = sy(p[1]) - py, d = dx * dx + dy * dy;
+      if (d < reach) { reach = d; best = p; }
+    }
+    return best;
+  }
+  function describe(p, px, py) {
+    hover = p;
+    tip.hidden = !p;
+    if (p) {
+      const say = () => tip.replaceChildren(h('b', { class: 'addr', text: p[0].toUpperCase() }), names.get(p[0]) ? ` ${names.get(p[0])}` : '',
+        h('div', { class: 'dim' }, `${DCS_KINDS[p[4]][0]} · heard `, agoEl(p[3])));
+      say();
+      tip.style.left = `${clamp(px + 14, 4, w - 260)}px`; tip.style.top = `${clamp(py + 14, 4, hgt - 50)}px`;
+      if (!names.has(p[0])) {  // the name is looked up the first time a platform is pointed at
+        names.set(p[0], '');
+        getJSON(`/api/dcs/platforms?limit=1&sort=address&q=${p[0]}`).then(d => {
+          if (d.items[0] && d.items[0].a === p[0]) names.set(p[0], d.items[0].nm || '');
+          if (hover === p) say();
+        }).catch(() => {});
+      }
+    }
+    canvas.style.cursor = p ? 'pointer' : 'grab';
+    draw();
+  }
+
+  let drag = null;
+  canvas.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY, moved: false }; canvas.setPointerCapture(e.pointerId); });
+  canvas.addEventListener('pointermove', e => {
+    const box = canvas.getBoundingClientRect(), px = e.clientX - box.left, py = e.clientY - box.top;
+    if (drag) {
+      if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 3) drag.moved = true;
+      if (drag.moved) {
+        view.x -= (e.clientX - drag.x) / view.k; view.y += (e.clientY - drag.y) / view.k;
+        drag.x = e.clientX; drag.y = e.clientY;
+        tip.hidden = true; hover = null; draw();
+      }
+    } else describe(nearest(px, py), px, py);
+  });
+  canvas.addEventListener('pointerup', e => {
+    const box = canvas.getBoundingClientRect(), was = drag;
+    drag = null;
+    if (was && !was.moved) { const p = nearest(e.clientX - box.left, e.clientY - box.top); if (p) onPick(p[0]); }
+  });
+  canvas.addEventListener('pointerleave', () => { if (!drag) describe(null); });
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const box = canvas.getBoundingClientRect(), px = e.clientX - box.left - w / 2, py = e.clientY - box.top - hgt / 2;
+    const before = view.k, k = clamp(before * Math.exp(-e.deltaY * 0.0015), 2, 4000);
+    view.x += px / before - px / k; view.y -= py / before - py / k;  // keep the spot under the cursor where it is
+    view.k = k; draw();
+  }, { passive: false });
+  new ResizeObserver(draw).observe(el);
+
+  async function load() {
+    if (!dcsBasemap) getJSON('/basemap.json').then(d => { dcsBasemap = d; draw(); }).catch(() => {});
+    let d;
+    try { d = await getJSON(`/api/dcs/map${span.value ? `?hours=${span.value}` : ''}`); } catch { return; }
+    points = d.points;
+    note.textContent = d.heard ? ` · ${d.placed.toLocaleString()} of ${d.heard.toLocaleString()} platforms have a known position` : '';
+    draw();
+  }
+  return {
+    el, load,
+    select(address) { selected = address; draw(); },
+    show(address) {  // bring one platform to the middle
+      const p = points.find(q => q[0] === address);
+      if (p) { view.x = p[2]; view.y = my(p[1]); view.k = Math.max(view.k, 60); fitted = true; draw(); }
+    },
+  };
+}
+
 function DcsView(root, initial) {
   let q = '', kind = store.get('dcs:kind', ''), sort = store.get('dcs:sort', 'last');
   let offset = 0, loading = false, done = false, run = 0, selected = null, ticks = 0, shownAll = false;
+  let mode = store.get('dcs:view', 'list');
+  const map = dcsMap(address => { location.hash = `#/dcs/${address}`; });
   const head = h('div', { class: 'dcshead' });
   const search = h('input', { type: 'search', placeholder: 'Find a platform: its address, or text in its latest message',
     oninput: debounce(() => { q = search.value.trim(); reload(); }, 300) });
@@ -1197,9 +1349,18 @@ function DcsView(root, initial) {
   const sentinel = h('div', { class: 'empty' });
   const list = h('div', { class: 'pane scroll dlist' }, rows, sentinel);
   const detail = h('div', { class: 'dcsdetail scroll' });
+  const views = h('div', { class: 'viewsw' });
   const el = h('div', { class: 'dcs' }, head, h('div', { class: 'dcsbody' },
-    h('div', { class: 'dcsleft' }, h('div', { class: 'dcsbar' }, search, sorter), chips, list), detail));
+    h('div', { class: 'dcsleft' }, h('div', { class: 'dcsbar' }, views, search, sorter), chips, list, map.el), detail));
   root.append(el);
+
+  function setMode(next) {
+    mode = next; store.set('dcs:view', mode);
+    el.classList.toggle('mapmode', mode === 'map');
+    views.replaceChildren(...[['list', 'List'], ['map', 'Map']].map(([value, label]) =>
+      h('button', { class: mode === value ? 'on' : '', text: label, onclick: () => setMode(value) })));
+    if (mode === 'map') map.load();
+  }
 
   function drawChips(count) {
     const chip = (label, value) => h('button', { class: kind === value ? 'on' : '', text: label,
@@ -1245,6 +1406,7 @@ function DcsView(root, initial) {
   }
   /** Bring the top of the list up to date without disturbing someone who has scrolled into it. */
   async function refresh() {
+    if (mode === 'map') return map.load();
     if (loading || list.scrollTop > 40) return;
     const mine = run;
     let d;
@@ -1326,6 +1488,9 @@ function DcsView(root, initial) {
       place && ['Location', h('a', { href: `https://www.openstreetmap.org/?mlat=${k.lat}&mlon=${k.lon}#map=11/${k.lat}/${k.lon}`,
         target: '_blank', rel: 'noopener', title: 'Open a map at this spot',
         text: `${Math.abs(k.lat).toFixed(4)}° ${k.lat >= 0 ? 'N' : 'S'}, ${Math.abs(k.lon).toFixed(4)}° ${k.lon >= 0 ? 'E' : 'W'} ↗` })],
+      place && ['', h('button', { class: 'link', text: 'Show on the map', onclick: async () => {
+        setMode('map'); el.classList.remove('has-sel'); await map.load(); map.show(d.a);
+      } })],
       k.transmit_interval && ['Transmits', `every ${k.transmit_interval} minutes`],
       k.sensors && ['Sensors', k.sensors],
       (k.manufacturer || k.model) && ['Transmitter', [k.manufacturer, k.model].filter(Boolean).join(' ')],
@@ -1367,6 +1532,7 @@ function DcsView(root, initial) {
     selected = address;
     if (changed) shownAll = false;
     el.classList.toggle('has-sel', !!address);
+    map.select(address);
     for (const r of rows.children) r.classList.toggle('on', r.dataset.a === address);
     if (!address) {
       detail.replaceChildren(h('div', { class: 'empty', text: 'Pick a platform to see its messages, its readings over time and how well it is being received.' }));
@@ -1382,6 +1548,7 @@ function DcsView(root, initial) {
     if (!changed) detail.scrollTop = at;
   }
 
+  setMode(mode);
   drawChips();
   drawHead();
   more();
