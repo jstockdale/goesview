@@ -1145,6 +1145,9 @@ const root = $('#view');
 
 const DCS_SATS = { 1: 'GOES-East', 2: 'GOES-West' };
 const dcsType = ty => ty === 'Unknown' ? 'binary' : ty;
+const dcsInferred = ty => !!ty && ty.endsWith('(inferred)');
+// Shorter names for the list; "≈" marks a decoding GOESview worked out from the message's shape.
+const dcsShort = ty => dcsInferred(ty) ? `≈ ${ty.replace(' (inferred)', '').replace('Pseudobinary', 'Pseudo')}` : dcsType(ty).replace('Pseudobinary', 'Pseudo');
 
 /** A line through [x, y] points, drawn to fill its box; the newest point is marked. */
 function trend(points) {
@@ -1201,7 +1204,7 @@ function DcsView(root, initial) {
   function drawChips(count) {
     const chip = (label, value) => h('button', { class: kind === value ? 'on' : '', text: label,
       onclick: () => { kind = value; store.set('dcs:kind', value); reload(); } });
-    chips.replaceChildren(chip('All', ''), chip('With readings', 'values'), chip('Text', 'text'), chip('Binary', 'binary'),
+    chips.replaceChildren(chip('All', ''), chip('With readings', 'values'), chip('Inferred', 'inferred'), chip('Text', 'text'), chip('Binary', 'binary'),
       chip('Flagged', 'flagged'), chip('Missed a slot', 'missed'), h('span', { class: 'spacer' }),
       h('span', { class: 'dim', text: count == null ? '' : `${count.toLocaleString()} platform${count === 1 ? '' : 's'}` }));
   }
@@ -1210,7 +1213,8 @@ function DcsView(root, initial) {
     h('span', { class: 'addr', text: p.a.toUpperCase() }),
     h('span', { class: 'what', title: p.x || '' }, p.nm && h('b', { text: p.nm }),
       h('span', { class: p.v ? 'vals' : 'raw', text: p.v || p.x || (p.n ? '' : 'never heard, only missed slots') })),
-    h('span', { class: 'ty' + (p.f & 255 ? ' warn' : ''), text: p.n ? dcsType(p.ty) : '' }),
+    h('span', { class: 'ty' + (p.f & 255 ? ' warn' : ''), text: p.n ? dcsShort(p.ty) : '',
+      title: dcsInferred(p.ty) ? 'Decoded by GOESview from the shape of the message: what each reading is, is not known' : dcsType(p.ty || '') }),
     h('span', { class: 'chn', text: `ch ${p.ch ?? '–'} · ${(DCS_SATS[p.sat] || '').replace('GOES-', '') || '?'}` }),
     h('span', { class: 'sig', text: p.sig != null ? `${p.sig.toFixed(1)} dBm` : '' }),
     p.t ? agoEl(p.t) : h('span', { class: 'dim', text: `${p.m} missed` }));
@@ -1280,7 +1284,10 @@ function DcsView(root, initial) {
             h('i', { style: `flex:${hr.east}` }), h('i', { style: `flex:${hr.west}` })),
           h('div', { class: 'dim', text: `${pct(hr.west, hr.n)} West` })),
         tile('Decoded readings', pct(hr.decoded, hr.n), 'of messages',
-          h('div', { class: 'dim', text: hr.types.map(([ty, n]) => `${dcsType(ty)} ${pct(n, hr.n)}`).join(' · ') })),
+          h('div', { class: 'dim', title: 'SatDump decodes a message when it knows the station. GOESview reads the rest where their shape allows, without knowing what each reading is.',
+            text: `${pct(hr.decoded - hr.inferred, hr.n)} by SatDump · ${pct(hr.inferred, hr.n)} inferred` }),
+          h('div', { class: 'dim', title: hr.types.map(([ty, n]) => `${dcsType(ty)} ${pct(n, hr.n)}`).join('\n'),
+            text: hr.types.slice(0, 4).map(([ty, n]) => `${dcsShort(ty)} ${pct(n, hr.n)}`).join(' · ') })),
         tile('Problems', hr.bad.toLocaleString(), 'flagged',
           h('div', { class: hr.bad / Math.max(1, hr.n) > 0.02 ? 'note' : 'dim', text: `${pct(hr.bad, hr.n)} of messages in the last hour` }),
           h('div', { class: 'dim', text: `${hr.missed.toLocaleString()} missed slots reported` }))),
@@ -1341,6 +1348,10 @@ function DcsView(root, initial) {
         d.f & 255 ? h('div', { class: 'note', text: `Latest message flagged: ${flagNames(d.f & 255).join(', ')}` }) : null),
       about.length ? h('div', { class: 'kv2' }, about.flatMap(([label, value]) => [h('span', { text: label }), h('span', {}, value)])) : null,
       series.length ? h('h3', { text: `Readings${span > 1 ? `, last ${span < 48 ? `${Math.round(span)} hours` : `${(span / 24).toFixed(1)} days`}` : ''}` }) : null,
+      series.length && dcsInferred(d.ty) ? h('div', { class: 'sub' },
+        `SatDump could not decode this platform's messages, so GOESview read the numbers from their shape (${d.ty.replace(' (inferred)', '').toLowerCase()}). `
+        + 'It cannot tell what each reading measures'
+        + (d.ty.startsWith('Pseudobinary') ? ', and the values assume two decimal places, as that format usually has.' : '.')) : null,
       series.length ? h('div', { class: 'cards' }, series.map(([name, points]) => card(name, points))) : null,
       d.messages.length ? h('h3', { text: 'Radio' }) : null,
       d.messages.length ? h('div', { class: 'cards' }, radio('Signal strength', 'sig', ' dBm'), radio('Phase noise', 'noise', '°'), radio('Frequency offset', 'off', ' Hz')) : null,
@@ -1392,7 +1403,7 @@ function DcsView(root, initial) {
 // Is everything that feeds the viewer healthy, and how has it been: SatDump's signal and lock
 // (read from its log), the machine, and GOESview itself.
 
-const SYS_RANGES = [[0.25, '15 minutes'], [1, '1 hour'], [6, '6 hours'], [24, '24 hours'], [168, '7 days'], [720, '30 days']];
+const SYS_RANGES = [[0.25, '15 minutes'], [1, '1 hour'], [3, '3 hours'], [6, '6 hours'], [24, '24 hours'], [168, '7 days'], [720, '30 days']];
 const SYS_STATE = { ok: 'Working', warn: 'Needs a look', bad: 'Problem', off: 'Not watched' };
 const duration = s => s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : s < 172800 ? `${(s / 3600).toFixed(1)} h` : `${Math.round(s / 86400)} days`;
 

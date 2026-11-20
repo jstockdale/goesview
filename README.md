@@ -196,8 +196,25 @@ SatDump does the decoding. It downloads two station tables, NOAA's platform
 table (PDT) and the HADS definitions, and with them it names each platform,
 gives its owner and position, and decodes the binary formats (Pseudobinary B,
 C and 2, and ASCII rows and columns) as well as SHEF text. Around half of all
-messages then arrive as named readings; the rest are shown as received. A
-platform in neither table is known by its address.
+messages then arrive as named readings. A platform in neither table is known
+by its address.
+
+SatDump leaves a message alone unless it knows the station's sensors and the
+message has exactly the shape that list predicts. GOESview reads three kinds
+of what is left, from their shape alone, and marks them **inferred**:
+
+- **Number tables**: a message that is only numbers, in rows and columns.
+- **Labelled text**: `:PRS 1 #1 3048 2993 :BAT 12.1`.
+- **Sutron Pseudobinary B**: readings of three characters each. The message
+  does not say how many sensors it has; GOESview groups consecutive readings
+  that sit close together into one sensor, or takes them as interleaved if
+  that needs fewer sensors. Values assume two decimal places, as SatDump does.
+
+That brings roughly three messages in four to readable numbers that can be
+charted. What inference cannot supply is meaning: such readings are called
+"Column 3" or "Sensor 2", not "river stage", unless the station's own sensor
+list happens to fit. Treat them as the station's numbers, not as measurements
+with units. Other formats are shown as received.
 
 **If SatDump stops writing files soon after you turn Parse DCS on**, look in
 its log for `Loading PDTs...` followed by `Error loading PDT line for DCP
@@ -210,7 +227,7 @@ is not fetched again, and start SatDump. The HADS table alone covers about
 18,000 stations.
 
 DCS is about a million messages a day, so GOESview reads the files once into
-a database of its own, `dcs-1.sqlite3` in the cache folder. It keeps one row
+a database of its own, `dcs-2.sqlite3` in the cache folder. It keeps one row
 per platform for good and every message for `--dcs-history` (3 days by
 default, about 300 MB a day). That database is GOESview's own and can be
 deleted; it is rebuilt from whatever DCS files are still on disk.

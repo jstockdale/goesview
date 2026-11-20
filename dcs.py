@@ -19,6 +19,7 @@ Three separate jobs live here, and only the first runs unless asked for:
 """
 
 import calendar
+import glob
 import json
 import os
 import re
@@ -108,6 +109,164 @@ def platform_details(dcp):
     return json.dumps(keep, separators=(",", ":")) if keep else None
 
 
+# ---------------------------------------------------------------- fallback decoding
+#
+# SatDump decodes a message when it knows the station's sensors (from HADS) and the message has
+# exactly the shape that list predicts. The rest arrive as text. Three kinds of that rest have a
+# shape that can be read without knowing the station, and are decoded here instead. What cannot
+# be known is what each reading IS: those are called "Column 3" or "Sensor 2", and the type says
+# "(inferred)" so nobody takes them for more than they are.
+
+INFERRED = " (inferred)"
+LABEL_RE = re.compile(r":([A-Za-z][\w.\-]{0,23})((?:[ \t]+#?[-+]?(?:\d+\.?\d*|\.\d+))+)")
+SPLIT_RE = re.compile(r"[\s,;]+")
+BATTERY = "Voltage - battery (volt)"
+
+
+def sensor_names(dcp):
+    """[(name, minutes between readings)] for a station, as SatDump has it from HADS."""
+    found = []
+    for pe in (dcp or {}).get("pe_info") or []:
+        if isinstance(pe, dict) and pe.get("name"):
+            interval = pe.get("record_interval")
+            found.append((str(pe["name"])[:80], interval if isinstance(interval, int) and interval > 0 else 0))
+    return found
+
+
+def labelled(text):
+    """':PRS 1 #1 3048 2993 :BAT 12.1' -> one reading list per label. The label is the name."""
+    out, covered = [], 0
+    for match in LABEL_RE.finditer(text):
+        name, body = match.groups()
+        covered += len(match.group(0))
+        tokens = body.split()
+        age = interval = 0
+        if len(tokens) >= 3 and tokens[1].startswith("#") and tokens[0].isdigit() and tokens[1][1:].isdigit():
+            age, interval, tokens = int(tokens[0]), int(tokens[1][1:]), tokens[2:]  # age and spacing, in minutes
+        values = [tidy(t) for t in tokens if not t.startswith("#")][:96]
+        if values:
+            out.append([name, interval, age, values])
+    if covered < 0.5 * len(text.strip()):
+        return None  # a stray label inside something else: that is not a decoding of the message
+    return out[:40] or None
+
+
+def table(text, sensors):
+    """A message that is nothing but numbers. Lines of equal length are readings over time, one
+    column per sensor; otherwise each line is taken as one sensor."""
+    lines = [line.strip() for line in text.replace("\r", "").split("\n") if line.strip()]
+    rows = []
+    for line in lines:
+        tokens = [t for t in SPLIT_RE.split(line) if t]
+        if tokens and all(NUMBER_RE.fullmatch(t) for t in tokens):
+            rows.append([tidy(t) for t in tokens])
+    if not rows or len(rows) < 0.6 * len(lines) or sum(len(r) for r in rows) < 2:
+        return None
+    if len({len(r) for r in rows}) == 1:
+        groups, word = [[row[i] for row in rows] for i in range(len(rows[0]))], "Column"
+    else:
+        groups, word = rows, "Line"
+    if len(groups) > 40:
+        return None
+    named = len(sensors) == len(groups)
+    return [[sensors[i][0] if named else f"{word} {i + 1}", 0, 0, values[:96]] for i, values in enumerate(groups)]
+
+
+def coherent(values):
+    """Do these look like one sensor's readings? Close together, allowing for a slow trend."""
+    seen = [v for v in values if v is not None]
+    return not seen or max(seen) - min(seen) <= max(30, 0.08 * max(abs(v) for v in seen))
+
+
+def pseudobinary_b(text, sensors):
+    """Sutron Pseudobinary B: 'B', a group character, an age, then readings of three characters
+    each (18 bits, signed, two implied decimals), and usually one last character for the battery.
+
+    The message does not say how many sensors it carries or how they are arranged. SatDump needs
+    HADS to agree with the message exactly and otherwise leaves it. Here the arrangement is worked
+    out from the readings themselves: the fewest sensors for which every sensor's readings sit
+    close together, tried both as blocks and interleaved.
+    """
+    body = text.strip().split(None, 1)[0] if text.strip() else ""
+    # "B1".."B4" is Sutron's own; "BC." and "BS." are the older kind SatDump also knows of.
+    if len(body) < 6 or body[0] != "B" or not ("1" <= body[1] <= "4" or (body[1] in "CS" and len(body) >= 9)):
+        return None
+    data = body[3:]
+    if any(not ("?" <= c <= "\x7f" or c == "/") for c in data) or len(data) % 3 == 2:
+        return None
+    battery = data[-1] if len(data) % 3 == 1 else None
+    if battery:
+        data = data[:-1]
+    readings = []
+    for i in range(0, len(data), 3):
+        chunk = data[i:i + 3]
+        if chunk == "///":
+            readings.append(None)  # the station had nothing for this slot
+            continue
+        raw = (ord(chunk[0]) & 63) << 12 | (ord(chunk[1]) & 63) << 6 | ord(chunk[2]) & 63
+        readings.append((raw ^ 0x20000) - 0x20000)
+    count = len(readings)
+    if not count or count > 400 or all(r is None for r in readings):
+        return None
+    # Sensors one after another, each with as many readings as it has: cut wherever the next
+    # reading no longer fits with the run so far.
+    groups = [[readings[0]]]
+    for reading in readings[1:]:
+        if coherent(groups[-1] + [reading]):
+            groups[-1].append(reading)
+        else:
+            groups.append([reading])
+    # Sensors with similar values (two river stages, say) pass as one run when they are really
+    # taking turns. That shows as a repeating pattern: every k-th reading agrees far better than
+    # the readings do as a whole.
+    known = [r for r in readings if r is not None]
+    whole = max(known) - min(known)
+    turning = False
+    if whole >= 8:
+        for k in range(2, 9):
+            if count % k or count // k < 2:
+                continue
+            turns = [[r for r in readings[j::k] if r is not None] for j in range(k)]
+            if sum(max(t) - min(t) for t in turns if t) <= 0.25 * whole:
+                groups, turning = [readings[j::k] for j in range(k)], True
+                break
+    # Or interleaved, one reading from each sensor in turn: taken if it needs fewer sensors.
+    for k in range(2, 2 if turning else len(groups)):
+        if count % k == 0 and all(coherent(readings[j::k]) for j in range(k)):
+            groups = [readings[j::k] for j in range(k)]
+            break
+    if len(groups) > 12:
+        return None  # that many "sensors" means the readings did not fall into runs: not this shape
+    standard = "1" <= body[1] <= "4"
+    age = ord(body[2]) & 63 if standard else 0
+    names = [n for n in sensors if n[0] != BATTERY] if battery and sensors and sensors[-1][0] == BATTERY else sensors
+    named = len(names) == len(groups)
+    out = [[names[i][0] if named else f"Sensor {i + 1}", names[i][1] if named else 0, age,
+            [f"{v / 100:.2f}".rstrip("0").rstrip(".") if v is not None else "" for v in group][:96]]
+           for i, group in enumerate(groups)]
+    if battery:  # SatDump's formulas: the first is Sutron's own, the second it worked out for the BC kind
+        volts = (ord(battery) & 63) * 0.234 + 10.6 if standard else (ord(battery) & 63) * 0.313 + 0.285
+        out.append([BATTERY, 0, age, [f"{volts:.2f}"]])
+    return out
+
+
+def fallback(text, dcp):
+    """(type, readings) for a message SatDump left undecoded, or None."""
+    if not text or len(text) > 6000:
+        return None
+    sensors = sensor_names(dcp)
+    for kind, decode in (("Labelled", lambda: labelled(text) if ":" in text else None),
+                         ("Pseudobinary B", lambda: pseudobinary_b(text, sensors) if text.lstrip()[:1] == "B" else None),
+                         ("Table", lambda: table(text, sensors))):
+        try:
+            readings = decode()
+        except (ValueError, IndexError, TypeError):
+            readings = None
+        if readings:
+            return kind + INFERRED, readings
+    return None
+
+
 def parse(raw, ftime):
     """One SatDump DCS file to (messages, missed).
 
@@ -146,10 +305,13 @@ def parse(raw, ftime):
                                for v in values[:40] if isinstance(v, dict)], separators=(",", ":"))
         rate = head.get("data_rate")
         dcp = block.get("dcp") if isinstance(block.get("dcp"), dict) else None
+        kind = str(block.get("data_type") or "Unknown")[:24]
+        if vals is None and (guess := fallback(str(block.get("data_ascii") or ""), dcp)):
+            kind, vals = guess[0], json.dumps(guess[1], separators=(",", ":"))
         rows.append([parse_time(head.get("carrier_start")), int(address, 16), channel, sat,
                      int(rate) if isinstance(rate, str) and rate.isdigit() else None,
                      number(head.get("signal_strength")), number(head.get("phase_noise")),
-                     number(head.get("freq_offset")), flags, str(block.get("data_type") or "Unknown")[:24],
+                     number(head.get("freq_offset")), flags, kind,
                      str(block.get("data_ascii") or "")[:4000], vals, platform_name(dcp), platform_details(dcp)])
     shift = round((ftime - max(ends)) / 3600) * 3600 if ends else 0
     for row in rows:
@@ -163,7 +325,12 @@ class DcsStore(threading.Thread):
 
     def __init__(self, folder, runs, history, log):
         super().__init__(daemon=True, name="dcs")
-        self.path = os.path.join(folder, "dcs-1.sqlite3")
+        self.path = os.path.join(folder, "dcs-2.sqlite3")
+        for stale in glob.glob(os.path.join(folder, "dcs-1.sqlite3*")):  # the previous layout: rebuilt from the files
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
         self.runs, self.history, self.log = runs, history, log
         self.seen = {}       # run name -> names of its files already read
         self.zips_done = set()
@@ -371,7 +538,7 @@ class DcsStore(threading.Thread):
         now = int(time.time())
         minute = now // 60
         lo = db.execute("SELECT min(lo) FROM files WHERE t >= ? AND lo IS NOT NULL", (now - 3700,)).fetchone()[0]
-        minutes, channels, types, sats, bad, total, decoded = {}, {}, {}, {1: 0, 2: 0}, 0, 0, 0
+        minutes, channels, types, sats, bad, total, decoded, inferred = {}, {}, {}, {1: 0, 2: 0}, 0, 0, 0, 0
         if lo is not None:
             minutes = dict(db.execute("SELECT t / 60, count(*) FROM messages WHERE id >= ? AND t >= ? GROUP BY 1",
                                       (lo, (minute - 60) * 60)))
@@ -380,6 +547,7 @@ class DcsStore(threading.Thread):
                     "WHERE id >= ? AND t >= ? GROUP BY 1, 2, 3, 4, 5", (lo, now - 3600)):
                 total += n
                 decoded += n if has_values else 0
+                inferred += n if has_values and typ and typ.endswith(INFERRED) else 0
                 channels[ch] = channels.get(ch, 0) + n
                 types[typ] = types.get(typ, 0) + n
                 sats[sat] = sats.get(sat, 0) + n
@@ -399,7 +567,7 @@ class DcsStore(threading.Thread):
         return {
             "now": now, "rate": round(sum(recent) / len(recent)) if recent else 0, "minutes": series,
             "hour": {"n": total, "east": sats.get(1, 0), "west": sats.get(2, 0), "bad": bad, "missed": missed or 0,
-                     "decoded": decoded,
+                     "decoded": decoded, "inferred": inferred,
                      "types": sorted(types.items(), key=lambda kv: -kv[1]),
                      "channels": sorted((ch, n) for ch, n in channels.items() if ch is not None)},
             "heard": {"hour": hour or 0, "day": day or 0, "ever": heard or 0, "known": known or 0},
@@ -425,6 +593,8 @@ class DcsStore(threading.Thread):
             where.append("vals IS NULL AND typ = 'ASCII'")
         elif kind == "binary":
             where.append("vals IS NULL AND typ != 'ASCII'")
+        elif kind == "inferred":
+            where.append(f"typ LIKE '%{INFERRED}'")
         elif kind == "flagged":
             where.append(f"(flags & {BAD}) != 0")
         elif kind == "missed":

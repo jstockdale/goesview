@@ -246,7 +246,7 @@ button.link:hover { text-decoration: underline; }
 .dcsbar { display: flex; gap: 8px; padding: 8px 14px 0; flex: none; }
 .dcsbar select { flex: none; }
 .dlist { padding: 8px 8px 30px; }
-.drow { display: grid; grid-template-columns: 9ch minmax(0, 1fr) 7ch 12ch 9ch 8ch; gap: 10px; align-items: baseline; padding: 5px 8px;
+.drow { display: grid; grid-template-columns: 9ch minmax(0, 1fr) 11ch 12ch 9ch 8ch; gap: 10px; align-items: baseline; padding: 5px 8px;
   border-radius: 6px; font-size: 12px; white-space: nowrap; }
 .drow:hover { background: var(--raise); }
 .drow.on { background: var(--raise); box-shadow: inset 2px 0 var(--accent); border-radius: 0 6px 6px 0; }
@@ -255,6 +255,7 @@ button.link:hover { text-decoration: underline; }
 .drow .what b { margin-right: 8px; }
 .drow .raw { font-family: var(--mono); color: var(--dim); }
 .drow .ty, .drow .chn, .drow .sig, .drow .ago, .drow > .dim { color: var(--dim); font-variant-numeric: tabular-nums; text-align: right; }
+.drow .ty { overflow: hidden; text-overflow: ellipsis; }
 .drow .ty.warn { color: var(--warn); }
 .dcsdetail { padding: 12px 14px 30px; min-width: 0; }
 .dcsdetail .back { display: none; color: var(--accent); margin-bottom: 8px; }
