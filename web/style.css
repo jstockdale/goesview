@@ -35,8 +35,8 @@ h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .08em; 
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
 .dot.ok { background: var(--good); box-shadow: 0 0 8px var(--good); }
 #full { padding: 2px 8px; }
-body.kiosk #nav, body.kiosk .brand { display: none; }
-body.kiosk #bar { height: 30px; background: transparent; border: 0; }
+/* full screen: the header stays, a little slimmer, so the pages remain a click away */
+body.kiosk #bar { height: 36px; }
 #view { flex: 1; min-height: 0; }
 
 /* shared image tile */
