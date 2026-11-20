@@ -24,6 +24,10 @@
 #   --archive-dcs --satdump-dcs-keep 15d
 # These are separate from the --satdump-* options above and touch only DCS files.
 #
+# System page: SatDump's signal and health are read from its log, looked for in the
+# service user's ~/.config/satdump. If SatDump runs as another user, add
+#   --satdump-log /home/THAT_USER/.config/satdump
+#
 # Install:
 #   sudo cp goesview.service /etc/systemd/system/
 #   sudo systemctl daemon-reload

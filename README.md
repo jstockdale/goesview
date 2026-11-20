@@ -18,6 +18,9 @@ weather products and text bulletins appear as they are received.
 - **DCS**: when SatDump's "Parse DCS" is on, a page for the Data Collection
   System: every platform heard, its latest message, its readings charted over
   time and how well it is being received.
+- **System**: a health page with traffic lights and charts: SatDump's signal,
+  error rate and lock, whether it has stopped or hung, arrivals, and the
+  machine's processor, memory, temperature, disk and battery.
 - **False colour that survives split scans.** SatDump only builds its colour
   composite when band 2 and band 13 land in the same timestamp folder, and the
   HRIT feed regularly files one of them under the previous scan. goesview pairs
@@ -231,6 +234,38 @@ are ever packed or deleted, only inside GOES HRIT run folders, never in a
 folder named with `--satdump-protect`, and `--prune-dry-run` makes both report
 without acting. The Live page shows the DCS policy on its own line under
 Storage.
+
+## System monitor
+
+The **System** page answers "is everything working, and has it been?".
+
+- **Traffic lights** for SatDump (running, reporting, locked, signal, error
+  rate), for each kind of product (how long since one arrived), and for the
+  machine (disk, temperature, processor, memory, power). The System link in
+  the header carries an amber or red dot when any of them needs a look, and
+  the Live page shows the same in one line.
+- **Charts** over the last 15 minutes up to 30 days: signal to noise, Viterbi
+  error rate, time in lock, files written by SatDump, arrivals in GOESview,
+  DCS messages, SatDump's warnings and errors, processor, load, temperature,
+  memory, disk and battery.
+- **Details** of the receiver (radio, frequency, sample rate, pipeline, where
+  it is writing) and SatDump's recent warnings and errors.
+
+SatDump's numbers come from its log, which it writes whether you run the
+window or the command line: a progress line every ten seconds with the
+signal, the error rate and the lock. GOESview only reads it. By default it
+looks in `~/.config/satdump`; point it elsewhere with `--satdump-log PATH`
+(a file or a folder), or use `--satdump-log none`. When SatDump runs on a
+different machine, its lights are off and the rest still works.
+
+Because the progress lines are regular, their absence is a signal too:
+**"No progress from SatDump for 4 min: the pipeline is stopped or SatDump has
+hung"** is exactly what a stalled decoder looks like from outside.
+
+The machine's readings come from Linux `/proc` and `/sys`. History is kept
+for 30 days in `monitor-1.sqlite3` in the cache folder, and on start the
+signal history is filled in from SatDump's current log. `--no-monitor`
+switches the page off.
 
 ## Colour tables
 

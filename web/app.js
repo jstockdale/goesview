@@ -505,6 +505,11 @@ function LiveView(root) {
             dcsZip && dcsZip.last && h('div', {}, `Last: ${dcsZip.last.day}, ${dcsZip.last.n.toLocaleString()} files, ${gb(dcsZip.last.freed)} GB into ${(dcsZip.last.size / 2 ** 20).toFixed(0)} MB · `, agoEl(dcsZip.last.t)),
             sweep(last && last.dcs)))));
     }
+    if (s.health) {
+      const tone = { ok: 'safe', warn: 'note', bad: 'alarm' }[s.health.state];
+      parts.push(fold('system', 'System', h('span', { class: tone, text: s.health.state === 'ok' ? 'everything is working' : `${s.health.n} to look at` }), false,
+        h('a', { class: `syslink ${tone}`, href: '#/system', title: 'Open the System page' }, s.health.text, h('span', { class: 'dim', text: '  Open the System page →' }))));
+    }
     if (s.dcs) {
       parts.push(fold('dcs', 'DCS', `${s.dcs.rate.toLocaleString()} messages / min`, false,
         h('div', { class: 'kpis two' },
@@ -1383,6 +1388,149 @@ function DcsView(root, initial) {
   };
 }
 
+// --------------------------------------------------------------- System
+// Is everything that feeds the viewer healthy, and how has it been: SatDump's signal and lock
+// (read from its log), the machine, and GOESview itself.
+
+const SYS_RANGES = [[0.25, '15 minutes'], [1, '1 hour'], [6, '6 hours'], [24, '24 hours'], [168, '7 days'], [720, '30 days']];
+const SYS_STATE = { ok: 'Working', warn: 'Needs a look', bad: 'Problem', off: 'Not watched' };
+const duration = s => s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : s < 172800 ? `${(s / 3600).toFixed(1)} h` : `${Math.round(s / 86400)} days`;
+
+/** A chart card: one or more lines over the same times. Gaps in the data stay gaps. */
+function sysChart(title, times, lines, { unit = '', digits = 1, zero = false, top = null } = {}) {
+  const values = lines.flatMap(l => l.values).filter(v => v != null);
+  if (!values.length) return null;
+  let lo = zero ? 0 : Math.min(...values), hi = top ?? Math.max(...values);
+  if (hi <= lo) { hi = lo + (Math.abs(lo) || 1) * 0.1; if (!zero) lo -= (Math.abs(lo) || 1) * 0.1; }
+  const W = 600, H = 120, n = times.length;
+  const x = i => n > 1 ? i / (n - 1) * W : W / 2, y = v => H - 4 - (v - lo) / (hi - lo) * (H - 8);
+  const path = vals => {
+    let d = '', pen = false;
+    vals.forEach((v, i) => {
+      if (v == null) { pen = false; return; }
+      d += `${pen ? 'L' : 'M'}${x(i).toFixed(1)},${y(clamp(v, lo, hi)).toFixed(1)}`;
+      pen = true;
+    });
+    return d;
+  };
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.innerHTML = [0.25, 0.5, 0.75].map(f => `<line class="grid" x1="0" x2="${W}" y1="${H * f}" y2="${H * f}"/>`).join('')
+    + lines.map(l => `<path class="${l.cls || ''}" d="${path(l.values)}"/>`).join('');
+  const fmt = v => `${(+v.toFixed(digits)).toLocaleString()}${unit}`;
+  const newest = vals => { for (let i = vals.length - 1; i >= 0; i--) if (vals[i] != null) return vals[i]; return null; };
+  const now = newest(lines[0].values);
+  const when = t => { const d = new Date(t * 1000), day = (times[n - 1] - times[0]) >= 80000 ? `${d.getUTCMonth() + 1}/${d.getUTCDate()} ` : ''; return `${day}${utc(t)}`; };
+  return h('div', { class: 'card chart' },
+    h('label', { text: title }),
+    h('div', { class: 'now' }, now != null ? h('b', { text: fmt(now) }) : h('b', { class: 'dim', text: 'no data now' }),
+      lines.length > 1 && h('span', { class: 'keys' }, lines.map(l => h('span', { class: l.cls || '', text: l.name }))),
+      h('small', { text: `${fmt(Math.min(...values))} to ${fmt(Math.max(...values))}` })),
+    svg,
+    h('div', { class: 'axis' }, h('span', { text: when(times[0]) }), h('span', { text: when(times[n - 1]) })));
+}
+
+function SystemView(root) {
+  let hours = +store.get('sys:hours', '1'), status = null, minute = null, minuteAt = 0, ticks = 0;
+  const lights = h('div', { class: 'lights' });
+  const ranges = h('div', { class: 'filters' });
+  const charts = h('div', { class: 'cards charts' });
+  const details = h('div', { class: 'sysdetails' });
+  root.append(h('div', { class: 'sys scroll' }, lights, ranges, charts, details));
+
+  function drawRanges() {
+    ranges.replaceChildren(h('span', { class: 'dim', text: 'Show the last' }), ...SYS_RANGES.map(([value, label]) =>
+      h('button', { class: value === hours ? 'on' : '', text: label,
+        onclick: () => { hours = value; store.set('sys:hours', value); minute = null; drawRanges(); load(true); } })));
+  }
+
+  function draw() {
+    if (!status) return;
+    lights.replaceChildren(...status.checks.map(c => h('div', { class: `light ${c.state}`, title: SYS_STATE[c.state] },
+      h('i'), h('div', {}, h('b', { text: c.label }), h('span', { text: c.text })))));
+
+    // Up to an hour comes at ten-second steps, as far back as this server has been running;
+    // anything longer, and all the counts, come by the minute.
+    const recent = status.recent, want = Math.round(hours * 360);
+    const cut = r => ({ t: r.t.slice(-want), series: Object.fromEntries(Object.entries(r.series).map(([k, v]) => [k, v.slice(-want)])) });
+    const fine = hours <= 1 && recent.t.length >= Math.min(want, 60) * 0.8 ? cut(recent) : null, slow = minute;
+    const pick = key => fine && fine.series[key] && fine.series[key].some(v => v != null) ? [fine.t, fine.series[key]]
+      : slow && slow.series[key] ? [slow.t, slow.series[key]] : null;
+    const chart = (title, keys, opts) => {
+      const got = keys.map(([key, name, cls]) => ({ key, name, cls, data: pick(key) })).filter(l => l.data);
+      if (!got.length) return null;
+      const times = got[0].data[0];
+      return sysChart(title, times, got.filter(l => l.data[0] === times).map(l => ({ name: l.name, cls: l.cls, values: l.data[1] })), opts);
+    };
+    charts.replaceChildren(...[
+      chart('Signal to noise', [['snr', 'now'], ['peak', 'peak', 'dimline']], { unit: ' dB', digits: 2 }),
+      chart('Viterbi error rate', [['ber', 'average'], ['ber_max', 'worst', 'dimline']], { digits: 3, zero: true }),
+      chart('Time in lock', [['sync', 'locked']], { unit: '%', digits: 0, zero: true, top: 100 }),
+      chart('Files written by SatDump, per minute', [['written', 'written'], ['lrit', 'received', 'dimline']], { zero: true }),
+      chart('Arrivals in GOESview, per minute', [['text', 'text'], ['imagery', 'imagery', 'line2'], ['weather', 'weather', 'line3']], { zero: true }),
+      chart('DCS messages per minute', [['dcs', 'messages']], { digits: 0, zero: true }),
+      chart('SatDump warnings and errors, per minute', [['warn', 'warnings', 'line3'], ['err', 'errors', 'line4']], { zero: true }),
+      chart('Processor', [['cpu', 'machine'], ['sd_cpu', 'SatDump', 'line2'], ['gv_cpu', 'GOESview', 'line3']], { unit: '%', digits: 0, zero: true }),
+      chart('Load', [['load', 'load']], { digits: 2, zero: true }),
+      chart('Temperature', [['temp', 'hottest sensor']], { unit: ' °C' }),
+      chart('Memory in use', [['mem', 'used']], { unit: '%', digits: 0, zero: true, top: 100 }),
+      chart('Disk in use', [['disk', 'used']], { unit: '%', digits: 1, zero: true, top: 100 }),
+      chart('Battery', [['battery', 'charge']], { unit: '%', digits: 0, zero: true, top: 100 }),
+    ].filter(Boolean));
+    if (!charts.children.length) charts.append(h('div', { class: 'empty', text: 'Gathering the first readings…' }));
+
+    const sd = status.satdump, host = status.host, gv = status.goesview, live = status.live, proc = host.satdump;
+    const rows = pairs => h('div', { class: 'kv2' }, pairs.filter(p => p && p[1] != null && p[1] !== '').flatMap(([k, v]) => [h('span', { text: k }), h('span', {}, v)]));
+    const gb = n => `${(n / 2 ** 30).toFixed(1)} GB`, mb = n => `${Math.round(n / 2 ** 20)} MB`;
+    details.replaceChildren(
+      h('div', { class: 'panel' }, h('h3', { text: 'Receiver' }), rows([
+        ['SatDump', sd.version || (sd.log ? 'version not in the log' : 'not found on this machine')],
+        ['Radio', sd.device],
+        ['Frequency', sd.frequency && `${(sd.frequency / 1e6).toFixed(3)} MHz`],
+        ['Sample rate', sd.samplerate && `${(sd.samplerate / 1e6).toFixed(3)} Msps`],
+        ['Signal', live.snr != null && `${live.snr.toFixed(2)} dB, peak ${live.peak.toFixed(2)} dB`],
+        ['Viterbi', live.ber != null && `${live.viterbi ? 'in sync' : 'NOT in sync'}, error rate ${live.ber.toFixed(4)}`],
+        ['Deframer', live.deframer != null && (live.deframer ? 'in sync' : 'NOT in sync')],
+        ['Last report', live.t && agoEl(live.t)],
+        ['Pipeline started', sd.pipeline && agoEl(sd.pipeline)],
+        ['Writing to', sd.output],
+        ['Parse DCS', sd.params && sd.params.parse_dcs],
+        ['Process', proc && `pid ${proc.pid}, ${proc.cpu ?? '–'}% of a core, ${mb(proc.rss)}, up ${duration(proc.up || 0)}`],
+        ['Log', sd.log],
+      ])),
+      h('div', { class: 'panel' }, h('h3', { text: 'This machine and GOESview' }), rows([
+        ['Processor', host.cpu != null && `${host.cpu.toFixed(0)}% busy, load ${host.load.toFixed(2)} on ${host.cores} cores`],
+        ['Memory', host.mem != null && `${gb(host.mem_total - host.mem_free)} used of ${gb(host.mem_total)}`],
+        ['Temperature', host.temp != null && `${host.temp.toFixed(1)} °C`],
+        ['Disk', host.disk != null && `${gb(host.disk_total - host.disk_free)} used of ${gb(host.disk_total)} (${host.disk.toFixed(1)}%)`],
+        ['Power', host.battery != null && `battery ${host.battery}%${host.power ? `, ${host.power.toLowerCase()}` : ''}`],
+        ['Up', host.up && duration(host.up)],
+        ['GOESview', `up ${duration(gv.up)}, ${gv.cpu ?? '–'}% of a core, ${gv.rss ? mb(gv.rss) : '–'}, Python ${gv.python}`],
+        ['Catalogue', `${gv.items.toLocaleString()} items`],
+        ['Viewers connected', String(gv.viewers)],
+        ['DCS files waiting', gv.dcs_backlog != null && gv.dcs_backlog.toLocaleString()],
+      ])),
+      h('div', { class: 'panel' }, h('h3', { text: 'SatDump warnings and errors, newest first' }),
+        status.messages.length ? status.messages.map(m => h('div', { class: `sysmsg ${m.level === 'W' ? 'warn' : 'bad'}` },
+          h('span', { class: 'dim' }, utc(m.t, true), ' · ', agoEl(m.t)), m.n > 1 && h('span', { class: 'dim', text: ` · ${m.n} times` }),
+          h('div', { text: m.text }))) : h('div', { class: 'dim', text: sd.log ? 'None since SatDump started.' : 'SatDump is not watched from this machine.' })));
+  }
+
+  async function load(now) {
+    try { status = await getJSON('/api/monitor'); } catch { status = null; }
+    if (!status) { lights.replaceChildren(h('div', { class: 'empty', text: 'The system monitor is switched off on this server.' })); return; }
+    if (now || !minute || Date.now() - minuteAt > 55000) {
+      try { minute = await getJSON(`/api/monitor/history?hours=${hours}`); minuteAt = Date.now(); } catch { /* keep the old one */ }
+    }
+    draw();
+  }
+
+  drawRanges();
+  load(true);
+  return { nav: 'system', onStats() { ticks++; load(false); } };
+}
+
 function route() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
   if (parts[0] === 'dcs' && state.view && state.view.nav === 'dcs') {  // picking a platform keeps the list where it is
@@ -1399,6 +1547,7 @@ function route() {
   else if (page === 'type') state.view = Viewer(root, arg, +extra || 0);
   else if (page === 'text') state.view = TextView(root, arg || null, +extra || 0);
   else if (page === 'dcs') state.view = DcsView(root, arg ? arg.toLowerCase() : null);
+  else if (page === 'system') state.view = SystemView(root);
   else state.view = LiveView(root);
   root.classList.toggle('flow', state.view.nav === 'live');  // the Live page stacks and scrolls as a whole in a narrow window
   for (const a of document.querySelectorAll('#nav a')) a.classList.toggle('on', a.dataset.nav === state.view.nav);
@@ -1444,6 +1593,11 @@ function applyStats(s) {
   const hour = Object.values(s.rate).flat().reduce((a, b) => a + b, 0);
   $('#rate').textContent = `${hour} items in the last hour`;
   $('#nav a[data-nav="dcs"]').hidden = !s.dcs;  // DCS shows only while SatDump is writing DCS files
+  const sys = $('#nav a[data-nav="system"]');   // the System link carries a dot when something needs a look
+  sys.hidden = !s.health;
+  sys.classList.toggle('warn', !!s.health && s.health.state === 'warn');
+  sys.classList.toggle('bad', !!s.health && s.health.state === 'bad');
+  sys.title = s.health ? s.health.text : '';
   if (state.view && state.view.onStats) state.view.onStats(s);
 }
 

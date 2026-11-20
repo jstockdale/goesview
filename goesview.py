@@ -50,6 +50,7 @@ from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import dcs
+import monitor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
@@ -1780,6 +1781,10 @@ class Handler(BaseHTTPRequestHandler):
             body = catalog.timeline(params.get("type", ""))
         elif name == "stats":
             body = self.app.stats()
+        elif name == "monitor" and self.app.monitor:
+            body = self.app.monitor.status()
+        elif name == "monitor/history" and self.app.monitor:
+            body = self.app.monitor.history(min(max(float(params.get("hours", 24)), 0.25), 24 * monitor.KEEP_DAYS))
         elif name.startswith("dcs/") and self.app.dcs:
             store = self.app.dcs
             if name == "dcs/summary":
@@ -1927,6 +1932,7 @@ class App:
         self.archiver = None
         self.dcs = None
         self.dcs_archiver = None
+        self.monitor = None
 
     def stats(self):
         disk = shutil.disk_usage(self.catalog.root)
@@ -1947,7 +1953,13 @@ class App:
                 brief = self.dcs.brief()
             except Exception:
                 traceback.print_exc()
-        return {**self.catalog.stats(), "storage": storage, "dcs": brief, **self.extra}
+        health = None
+        if self.monitor:
+            try:
+                health = self.monitor.brief()
+            except Exception:
+                traceback.print_exc()
+        return {**self.catalog.stats(), "storage": storage, "dcs": brief, "health": health, **self.extra}
 
     def watch(self, interval):
         ticks = 0
@@ -2032,6 +2044,11 @@ def main():
         ap.add_argument(old, dest="renamed", help=argparse.SUPPRESS)
     ap.add_argument("--no-text-index", action="store_true",
                     help="do not build the full-text search index for the Text page (it is small: a few percent of the size of the bulletin text)")
+    ap.add_argument("--satdump-log", metavar="PATH", default="auto",
+                    help="SatDump's log file, or the folder it keeps its logs in, for the System page: signal, error "
+                         "rate, lock, and whether SatDump has stopped or hung. It is only read. Default: "
+                         "~/.config/satdump if it exists; \"none\" to leave SatDump out")
+    ap.add_argument("--no-monitor", action="store_true", help="no System page and no health checks")
     ap.add_argument("--satdump-api", help="URL of SatDump's HTTP stats (satdump live ... --http_server), e.g. http://127.0.0.1:8081/api")
     ap.add_argument("--verbose", action="store_true", help="log every request")
     args = ap.parse_args()
@@ -2120,6 +2137,19 @@ def main():
         log(f"DCS archive: on{dry}; finished days are packed into <run>/{dcs.DCS_ARCHIVE_DIR}/DAY.zip and the loose files deleted")
     else:
         log("DCS archive: off (see --archive-dcs)")
+
+    if not args.no_monitor:
+        where = None if args.satdump_log == "none" else args.satdump_log
+        if where == "auto":
+            where = os.path.expanduser("~/.config/satdump")
+            where = where if os.path.isdir(where) else None
+        try:
+            os.makedirs(args.cache, exist_ok=True)
+            app.monitor = monitor.Monitor(args.cache, app, log, where)
+            app.monitor.start()
+            log(f"system monitor: on; SatDump's log: {where or 'not found, so only this machine and GOESview are watched'}")
+        except Exception as exc:
+            log(f"system monitor unavailable ({exc})")
 
     if args.satdump_api:
         threading.Thread(target=poll_satdump, args=(args.satdump_api, app.extra), daemon=True).start()
