@@ -554,17 +554,23 @@ class Catalog:
 
     def search_text(self, index, text, type_id=None, before=None, limit=30):
         """Full-text matches newest first, as ([(item, excerpt)], cursor, more)."""
+        match, words, phrases = parse_query(text)
         out, cursor, more = [], before, False
-        for _ in range(25):  # a type filter may discard most hits; look further, within reason
-            rows = index.search(text, cursor, 200)
-            with self.lock:
-                for rowid, path, excerpt in rows:
-                    item = self.by_path.get(path)
-                    if item is not None and (not type_id or item.type.id == type_id):
+        if not match:
+            return out, cursor, more
+        for _ in range(25):  # filters and phrase checks may discard most candidates; look further, within reason
+            rows = index.search(match, cursor, 200)
+            for rowid, path in rows:
+                with self.lock:
+                    item = self.by_path.get(path) if path else None
+                if item is not None and (not type_id or item.type.id == type_id):
+                    body = index.text_of(item.path)
+                    excerpt = passage(body, words, phrases) if body is not None else None
+                    if excerpt is not None:  # None: a quoted phrase is not actually in this one
                         if len(out) == limit:
                             return out, cursor, True
                         out.append((item, excerpt))
-                    cursor = rowid
+                cursor = rowid
             more = len(rows) == 200
             if not more:
                 break
@@ -845,45 +851,92 @@ def poll_satdump(url, state):
 
 # ---------------------------------------------------------------- text search
 
-def fts_query(text):
-    """What someone typed, as an FTS5 query: every word must appear (matching from
-    the start of a word), and "quoted phrases" must appear exactly."""
-    parts = []
-    for phrase, word in re.findall(r'"([^"]+)"|(\S+)', text):
-        if phrase:
-            words = re.sub(r"[^\w]+", " ", phrase).split()
-            if words:
-                parts.append('"' + " ".join(words) + '"')
+WORD = "0-9A-Za-z"
+
+
+def parse_query(text):
+    """What someone typed, as (FTS5 query, words, phrases).
+
+    Every word must appear, matching from the start of a word. A "quoted phrase" must
+    appear exactly; the index only knows which bulletins hold each word, so it narrows
+    the field to those holding all the phrase's words and the phrase itself is then
+    checked against each bulletin's text.
+    """
+    words, phrases, match = [], [], []
+    for quoted, bare in re.findall(r'"([^"]+)"|(\S+)', text):
+        parts = re.sub(rf"[^{WORD}]+", " ", quoted or bare).split()
+        if quoted and parts:
+            phrases.append(parts)
+            match += [f'"{w}"' for w in parts]
         else:
-            parts += [f'"{w}"*' for w in re.sub(r"[^\w]+", " ", word).split()]
-    return " ".join(parts)
+            words += parts
+            match += [f'"{w}"*' for w in parts]
+    return " ".join(match), words, phrases
+
+
+def passage(text, words, phrases):
+    """The stretch of `text` around the first match, with every match marked off by
+    \x02 and \x03. None if a quoted phrase is missing; "" if nothing in the text matched
+    (the hit was on the product or office code)."""
+    sep = f"[^{WORD}]+"
+    exact = [rf"(?<![{WORD}]){sep.join(map(re.escape, p))}(?![{WORD}])" for p in phrases]
+    if any(not re.search(pattern, text, re.I) for pattern in exact):
+        return None
+    patterns = exact + [rf"(?<![{WORD}]){re.escape(w)}[{WORD}]*" for w in words]
+    if not patterns:
+        return ""
+    finder = re.compile("|".join(patterns), re.I)
+    first = finder.search(text)
+    if not first:
+        return ""
+    start, end = max(0, first.start() - 90), min(len(text), first.start() + 200)
+    if start:
+        start = text.find(" ", start) + 1 or start
+    if end < len(text):
+        end = text.rfind(" ", start, end) if text.rfind(" ", start, end) > first.end() else end
+    marked = finder.sub(lambda m: f"\x02{m.group(0)}\x03", text[start:end])
+    return ("… " if start else "") + marked.strip() + (" …" if end < len(text) else "")
 
 
 class TextIndex(threading.Thread):
     """Full-text search over the text bulletins: an SQLite FTS5 index in the cache folder.
 
-    Row ids encode arrival time, so "newest first" is the index's natural order and
-    a page of results costs the same however many bulletins match.
+    The index records only which bulletins contain which words: no copy of the text and
+    no word positions, which makes it a few percent of the size of the bulletins.
+    Excerpts and phrase checks read the bulletin itself. Row ids encode arrival time,
+    so "newest first" is the index's natural order.
+
+    An index like this cannot forget a single bulletin, so deleting one only removes it
+    from the `files` table and its words stay behind, unreachable. When enough of those
+    have built up the whole index is rebuilt in the background, which is quick.
     """
     SCHEMA = """
         CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, id INTEGER UNIQUE);
-        CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(name, body, path UNINDEXED);
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER);
+        CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(name, body, content='', detail=none);
     """
     LIMIT = 100_000  # bytes of a bulletin that are indexed; a few data tables run far longer
 
-    def __init__(self, catalog, path):
+    def __init__(self, catalog, folder):
         super().__init__(daemon=True, name="text-index")
-        self.catalog, self.path = catalog, path
+        self.catalog = catalog
+        self.path = os.path.join(folder, "text-index-2.sqlite3")
+        for stale in ("text-index.sqlite3", "text-index.sqlite3-wal", "text-index.sqlite3-shm"):
+            try:  # the first design kept a second copy of every bulletin; it is not migrated, just rebuilt
+                os.unlink(os.path.join(folder, stale))
+            except OSError:
+                pass
         self.jobs = queue.Queue()
         self.total = self.done = 0  # progress of the catch-up after start
         self.ready = False
+        self.indexed = self.dropped = 0
         db = self.connect()
         db.executescript(self.SCHEMA)  # raises here if this SQLite has no FTS5
         db.close()
         catalog.listeners.append(self.on_item)
 
-    def connect(self):
-        db = sqlite3.connect(self.path, timeout=30)
+    def connect(self, path=None):
+        db = sqlite3.connect(path or self.path, timeout=30)
         try:
             db.execute("PRAGMA journal_mode=WAL")  # readers keep working while it writes
             db.execute("PRAGMA synchronous=NORMAL")
@@ -898,10 +951,16 @@ class TextIndex(threading.Thread):
     def forget(self, paths):
         self.jobs.put(("drop", [p for p in paths if p.lower().endswith(".txt")]))
 
+    def text_of(self, path):
+        raw = self.catalog.read_bytes(path, self.LIMIT)
+        return None if raw is None else CONTROL_RE.sub(" ", raw.decode("latin-1"))
+
     # -- writing: one thread owns it
 
     def run(self):
         db = self.connect()
+        self.indexed = (db.execute("SELECT value FROM meta WHERE key = 'indexed'").fetchone() or [0])[0]
+        self.dropped = self.indexed - db.execute("SELECT count(*) FROM files").fetchone()[0]
         try:
             self.catch_up(db)
         except Exception:
@@ -909,6 +968,16 @@ class TextIndex(threading.Thread):
         self.ready = True
         while True:
             self.drain(db, block=True)
+            if self.dropped > max(5000, self.indexed * 0.3):
+                try:
+                    db = self.rebuild(db)
+                except Exception:
+                    traceback.print_exc()
+                    self.dropped = 0  # do not retry in a tight loop
+
+    def save(self, db):
+        db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('indexed', ?)", (self.indexed,))
+        db.commit()
 
     def drain(self, db, block=False):
         try:
@@ -934,40 +1003,69 @@ class TextIndex(threading.Thread):
                 job = self.jobs.get_nowait()
             except queue.Empty:
                 break
-        db.commit()
+        self.save(db)
+
+    def fill(self, db, todo):
+        """Index (path, arrival, name) triples, staying out of the way of everything else."""
+        for start in range(0, len(todo), 500):
+            for job in todo[start:start + 500]:
+                self.add(db, *job)
+            self.save(db)
+            self.done = min(len(todo), start + 500)
+            time.sleep(0.02)
 
     def catch_up(self, db):
-        """Index what arrived while GOESview was not running, newest first, and
-        drop what has since been deleted."""
+        """Index what arrived while GOESview was not running, newest first, and forget
+        what has since been deleted."""
         known = {row[0] for row in db.execute("SELECT path FROM files")}
         with self.catalog.lock:
             texts = [(i.path, i.recv, i.name or "") for i in self.catalog.items if i.kind == "text"]
         present = {path for path, _, _ in texts}
         for path in known - present:
             self.drop(db, path)
-        db.commit()
+        self.save(db)
         todo = [t for t in reversed(texts) if t[0] not in known]
         self.total = len(todo)
         if todo:
             log(f"text index: adding {len(todo)} bulletins")
+            started = time.time()
+            self.fill(db, todo)
+            log(f"text index: caught up in {time.time() - started:.0f}s, "
+                f"{human(os.path.getsize(self.path))} for {self.indexed - self.dropped} bulletins")
+
+    def rebuild(self, db):
+        """Start again from the bulletins that still exist, then swap the new index in."""
+        log(f"text index: rebuilding to shed {self.dropped} deleted bulletins")
         started = time.time()
-        for start in range(0, len(todo), 250):
-            for job in todo[start:start + 250]:
-                self.add(db, *job)
-            db.commit()
-            self.done = min(len(todo), start + 250)
-            self.drain(db)       # keep up with arrivals meanwhile
-            time.sleep(0.02)     # and leave the disk some room for everything else
-        if todo:
-            log(f"text index: caught up in {time.time() - started:.0f}s")
+        fresh_path = self.path + ".new"
+        for ext in ("", "-wal", "-shm"):
+            if os.path.exists(fresh_path + ext):
+                os.unlink(fresh_path + ext)
+        fresh = self.connect(fresh_path)
+        fresh.executescript(self.SCHEMA)
+        with self.catalog.lock:
+            texts = [(i.path, i.recv, i.name or "") for i in reversed(self.catalog.items) if i.kind == "text"]
+        self.indexed = self.dropped = 0
+        self.fill(fresh, texts)
+        fresh.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        fresh.close()
+        db.close()
+        os.replace(fresh_path, self.path)  # searches open the file per query, so they just see the new one
+        for ext in ("-wal", "-shm"):
+            for leftover in (self.path + ext, fresh_path + ext):
+                try:
+                    os.unlink(leftover)
+                except OSError:
+                    pass
+        log(f"text index: rebuilt in {time.time() - started:.0f}s, {human(os.path.getsize(self.path))}")
+        return self.connect()
 
     def add(self, db, path, recv, name):
         if db.execute("SELECT 1 FROM files WHERE path = ?", (path,)).fetchone():
             return
-        raw = self.catalog.read_bytes(path, self.LIMIT)
-        if raw is None:
+        body = self.text_of(path)
+        if body is None:
             return
-        body = CONTROL_RE.sub(" ", raw.decode("latin-1"))
         # "AFDSEWWA · FXUS66 KSEW" also answers to its parts: AFD, SEW, WA
         ident = name.split(" ")[0] if name else ""
         keys = f"{name} {ident[:3]} {ident[3:6]} {ident[6:]}" if len(ident) == 8 else name
@@ -978,28 +1076,25 @@ class TextIndex(threading.Thread):
                 break
             except sqlite3.IntegrityError:
                 rowid += 1
-        db.execute("INSERT INTO docs (rowid, name, body, path) VALUES (?, ?, ?, ?)", (rowid, keys, body, path))
+        db.execute("INSERT INTO docs (rowid, name, body) VALUES (?, ?, ?)", (rowid, keys, body))
+        self.indexed += 1
 
     def drop(self, db, path):
-        row = db.execute("SELECT id FROM files WHERE path = ?", (path,)).fetchone()
-        if row:
-            db.execute("DELETE FROM docs WHERE rowid = ?", row)
-            db.execute("DELETE FROM files WHERE path = ?", (path,))
+        if db.execute("DELETE FROM files WHERE path = ?", (path,)).rowcount:
+            self.dropped += 1
 
     # -- reading: any thread, its own connection
 
-    def search(self, text, before=None, limit=200):
-        """Matches newest first as (row id, path, excerpt). Excerpts mark the hit with \x02 and \x03."""
-        match = fts_query(text)
-        if not match:
-            return []
+    def search(self, match, before=None, limit=200):
+        """Bulletins holding every word, newest first, as (row id, path or None).
+        A path of None is a deleted bulletin whose words are still in the index."""
         db = self.connect()
         try:
-            return db.execute(
-                "SELECT docs.rowid, files.path, snippet(docs, 1, char(2), char(3), ' … ', 28)"
-                " FROM docs JOIN files ON files.id = docs.rowid WHERE docs MATCH ?"
-                + (" AND docs.rowid < ?" if before else "") + " ORDER BY docs.rowid DESC LIMIT ?",
-                (match, before, limit) if before else (match, limit)).fetchall()
+            ids = [row[0] for row in db.execute(
+                "SELECT rowid FROM docs WHERE docs MATCH ?" + (" AND rowid < ?" if before else "")
+                + " ORDER BY rowid DESC LIMIT ?", (match, before, limit) if before else (match, limit))]
+            paths = dict(db.execute(f"SELECT id, path FROM files WHERE id IN ({','.join('?' * len(ids))})", ids)) if ids else {}
+            return [(rowid, paths.get(rowid)) for rowid in ids]
         except sqlite3.OperationalError:
             return []
         finally:
@@ -1851,7 +1946,7 @@ def main():
     for old in ("--keep", "--max-size", "--min-free"):  # early names that did not say whose files they deleted
         ap.add_argument(old, dest="renamed", help=argparse.SUPPRESS)
     ap.add_argument("--no-text-index", action="store_true",
-                    help="do not build the full-text search index for the Text page (it takes about twice the size of the bulletin text)")
+                    help="do not build the full-text search index for the Text page (it is small: a few percent of the size of the bulletin text)")
     ap.add_argument("--satdump-api", help="URL of SatDump's HTTP stats (satdump live ... --http_server), e.g. http://127.0.0.1:8081/api")
     ap.add_argument("--verbose", action="store_true", help="log every request")
     args = ap.parse_args()
@@ -1894,7 +1989,7 @@ def main():
     if not args.no_text_index:
         try:
             os.makedirs(args.cache, exist_ok=True)
-            app.text_index = TextIndex(catalog, os.path.join(args.cache, "text-index.sqlite3"))
+            app.text_index = TextIndex(catalog, args.cache)
             app.text_index.start()
         except Exception as exc:
             log(f"full-text search unavailable ({exc}); the Text page filters by product and office only")

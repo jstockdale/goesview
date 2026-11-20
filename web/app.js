@@ -336,8 +336,16 @@ function LiveView(root) {
         spark(rate.length ? rate : new Array(60).fill(0)),
         s.last[sec] ? agoEl(s.last[sec]) : h('span', { class: 'dim', text: 'nothing yet' }));
     };
-    const parts = [h('h3', { text: 'Reception, last hour' }),
-      h('div', { class: 'kpis' }, kpi('Imagery', 'imagery'), kpi('Weather', 'weather'), kpi('Text', 'text'))];
+    // Each section folds away; the choice is remembered. `brief` is what shows while it is folded.
+    const fold = (key, title, brief, open, ...content) => {
+      const el = h('details', { class: 'fold', open: store.get(`fold:${key}`, open ? '1' : '0') === '1' },
+        h('summary', {}, h('span', { text: title }), h('span', { class: 'brief' }, brief)), ...content);
+      el.addEventListener('toggle', () => store.set(`fold:${key}`, el.open ? '1' : '0'));
+      return el;
+    };
+    const hourly = Object.values(s.rate).flat().reduce((a, b) => a + b, 0);
+    const parts = [fold('reception', 'Reception, last hour', `${hourly} items`, true,
+      h('div', { class: 'kpis' }, kpi('Imagery', 'imagery'), kpi('Weather', 'weather'), kpi('Text', 'text')))];
     const settle = [];  // run once the strips are on the page
     for (const scan of s.scans) {
       const all = [...new Set(scan.slots.flatMap(x => x.b))].sort((a, b) => a - b);
@@ -380,10 +388,10 @@ function LiveView(root) {
       };
       scroller.addEventListener('scroll', where, { passive: true });
       settle.push(where);
-      parts.push(h('h3', { text: `${scan.g}: bands per scan, last 24 h` }), scroller,
+      parts.push(fold(`scan:${scan.g}`, `${scan.g}: bands per scan, last 24 h`, `newest ${utc(slots[last].t)}`, true, scroller,
         h('div', { class: 'where' }, place, h('span', { class: 'spacer' }), home),
         h('div', { class: 'legend' }, 'UTC hour', h('i', { style: 'background:var(--good)' }), 'received',
-          h('i', { style: 'background:var(--warn)' }), 'filed under an earlier scan'));
+          h('i', { style: 'background:var(--warn)' }), 'filed under an earlier scan')));
     }
     if (s.storage) {
       const { free, total, cache, satdump, dry, last, scope, archive } = s.storage, gb = n => (n / 2 ** 30).toFixed(n < 100 * 2 ** 30 ? 1 : 0);
@@ -398,7 +406,9 @@ function LiveView(root) {
       const used = 1 - free / total, trial = dry ? ' (dry run)' : '';
       const sweep = info => info && h('div', {}, `${info.dry ? 'Would remove' : 'Last removed'} ${info.what} · `, agoEl(info.t));
       // Two kinds of files, shown apart: our own cache, and what SatDump received.
-      parts.push(h('h3', { text: 'Storage' }),
+      // Folded by default: the one line says how full the disk is and whether SatDump data can be deleted.
+      const brief = [`${gb(free)} GB free`, satdump && h('span', { class: 'note', text: ' · SatDump data is pruned' })];
+      parts.push(fold('storage', 'Storage', brief, false,
         h('div', { class: 'meter', title: `${Math.round(used * 100)}% of the disk used` },
           h('i', { class: used > 0.9 ? 'full' : '', style: `width:${(used * 100).toFixed(1)}%` })),
         h('div', { class: 'legend' }, `${gb(free)} GB free of ${gb(total)} GB`),
@@ -410,14 +420,14 @@ function LiveView(root) {
             h('div', {}, `${plural(archive.days, 'day')} packed so far`),
             archive.last && h('div', {}, `Last: ${archive.last.day}, ${archive.last.n.toLocaleString()} bulletins, ${gb(archive.last.freed)} GB of files into ${(archive.last.size / 2 ** 20).toFixed(0)} MB · `, agoEl(archive.last.t))),
           h('b', { class: satdump ? 'deletes' : '', text: 'SatDump data' }),
-          h('span', {}, satdump ? `${satdump}; older data is deleted${trial}` : 'never deleted', reach, sweep(last && last.satdump))));
+          h('span', {}, satdump ? `${satdump}; older data is deleted${trial}` : 'never deleted', reach, sweep(last && last.satdump)))));
     }
     if (s.satdump) {
       const keys = Object.keys(s.satdump);
       const wanted = keys.filter(k => /snr|ber|lock|freq|sync|deframer|viterbi|rs_avg/i.test(k));
       const kv = h('div', { class: 'kv' });
       for (const k of (wanted.length ? wanted : keys).slice(0, 12)) kv.append(h('span', { text: k, title: k }), h('span', { text: s.satdump[k] }));
-      parts.push(h('h3', { text: 'SatDump' }), kv);
+      parts.push(fold('satdump', 'SatDump', '', true, kv));
     }
     // The panel is redrawn every few seconds: keep each strip where the reader left it,
     // and pinned to the newest scan unless they scrolled back.

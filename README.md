@@ -69,8 +69,10 @@ previews for the last 24; on a small machine shorten that with
 The Text page's search box looks through the full text of every bulletin as
 well as product and office codes: every word must appear, and a phrase in
 quotes must match exactly. The index behind it lives in the cache folder as
-`text-index.sqlite3` and takes about twice the size of the bulletin text; it
-is built in the background on first start and kept current after that.
+`text-index-2.sqlite3`. It records only which bulletins contain which words,
+so it is a few percent of the size of the bulletin text; excerpts are read
+from the bulletins themselves. It is built in the background on first start
+and kept current after that.
 
 ## Retention
 
