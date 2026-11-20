@@ -1091,9 +1091,15 @@ function fullscreen() {
 }
 document.addEventListener('fullscreenchange', () => document.body.classList.toggle('kiosk', !!document.fullscreenElement));
 $('#full').addEventListener('click', fullscreen);
-// Header links always clear the pop-up, as Esc does: a link to the page you are already on
-// changes nothing in the address, so without this it would do nothing at all.
-$('#bar').addEventListener('click', e => { if (e.target.closest('a')) popup.close(); });
+// Header links always clear the pop-up, as Esc does. A link to the page already showing
+// (GOESview or Live while on the Live page) changes nothing in the address, so the browser
+// would do nothing: treat it as "show me this page afresh", back in its starting state.
+$('#bar').addEventListener('click', e => {
+  const link = e.target.closest('a');
+  if (!link || !plainClick(e)) return;
+  popup.close();
+  if (link.getAttribute('href') === (location.hash || '#/')) { e.preventDefault(); route(); }
+});
 document.addEventListener('keydown', e => { if (e.key === 'f' && !/INPUT|SELECT|TEXTAREA/.test(e.target.tagName) && !e.metaKey && !e.ctrlKey) fullscreen(); });
 
 loadTypes().then(() => { route(); connect(); addEventListener('hashchange', route); })
