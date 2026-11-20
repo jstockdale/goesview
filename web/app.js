@@ -457,7 +457,9 @@ function LiveView(root) {
           h('i', { style: 'background:var(--warn)' }), 'filed under an earlier scan')));
     }
     if (s.storage) {
-      const { free, total, cache, satdump, dry, last, scope, archive } = s.storage, gb = n => (n / 2 ** 30).toFixed(n < 100 * 2 ** 30 ? 1 : 0);
+      const { free, total, cache, satdump, dry, last, scope, archive } = s.storage;
+      const dcsKeep = s.storage.dcs && s.storage.dcs.limits, dcsZip = s.storage.dcs && s.storage.dcs.archive;
+      const gb = n => (n / 2 ** 30).toFixed(n < 100 * 2 ** 30 ? 1 : 0);
       const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
       // Exactly which folders SatDump retention may delete from, and what it leaves alone.
       const reach = satdump && scope && h('div', { class: 'reach' },
@@ -477,8 +479,9 @@ function LiveView(root) {
           : h('span', { class: 'note', text: 'oldest data will be deleted as needed' });
       // Folded, the heading carries the SatDump setting, which is one of two things: delete oldest, or never delete.
       // A dry run is a third, testing-only state: limits are set but not in force.
-      const brief = deleting ? h('span', { class: 'note', text: 'SatDump pruning: delete oldest' })
-        : h('span', { class: 'safe', text: `SatDump pruning: ${satdump ? 'dry run' : 'never delete'}` });
+      // DCS files are SatDump's too, under a policy of their own: either one deleting makes the heading amber.
+      const brief = (satdump || dcsKeep) && !dry ? h('span', { class: 'note', text: 'SatDump pruning: delete oldest' })
+        : h('span', { class: 'safe', text: `SatDump pruning: ${satdump || dcsKeep ? 'dry run' : 'never delete'}` });
       parts.push(fold('storage', 'Storage', brief, false,
         h('div', { class: 'pinned' },
           h('div', { class: 'meter', title: `${Math.round(used * 100)}% of the disk used` },
@@ -492,7 +495,24 @@ function LiveView(root) {
             h('div', {}, `${plural(archive.days, 'day')} zipped so far`),
             archive.last && h('div', {}, `Last: ${archive.last.day}, ${archive.last.n.toLocaleString()} bulletins, ${gb(archive.last.freed)} GB of files into ${(archive.last.size / 2 ** 20).toFixed(0)} MB · `, agoEl(archive.last.t))),
           h('b', { class: deleting ? 'deletes' : '', text: 'SatDump data' }),
-          h('span', {}, satdump ? `${satdump}; ` : '', verdict, reach, sweep(last && last.satdump)))));
+          h('span', {}, satdump ? `${satdump}; ` : '', verdict, reach, sweep(last && last.satdump)),
+          (s.dcs || dcsKeep || dcsZip) && h('b', { class: dcsKeep && !dry ? 'deletes' : '', text: 'DCS files' }),
+          (s.dcs || dcsKeep || dcsZip) && h('span', {}, dcsKeep ? `${dcsKeep}; ` : '',
+            !dcsKeep ? h('span', { class: 'safe', text: 'never deleted' })
+              : dry ? h('span', { class: 'safe', text: 'dry run: nothing will be deleted' })
+                : h('span', { class: 'note', text: 'oldest DCS files will be deleted as needed' }),
+            dcsZip && h('div', {}, `today's as files, past days zipped${dcsZip.dry ? ' (dry run)' : ''}; ${plural(dcsZip.days, 'day')} zipped so far`),
+            dcsZip && dcsZip.last && h('div', {}, `Last: ${dcsZip.last.day}, ${dcsZip.last.n.toLocaleString()} files, ${gb(dcsZip.last.freed)} GB into ${(dcsZip.last.size / 2 ** 20).toFixed(0)} MB · `, agoEl(dcsZip.last.t)),
+            sweep(last && last.dcs)))));
+    }
+    if (s.dcs) {
+      parts.push(fold('dcs', 'DCS', `${s.dcs.rate.toLocaleString()} messages / min`, false,
+        h('div', { class: 'kpis two' },
+          h('a', { class: 'kpi', href: '#/dcs', title: 'Open the DCS page' }, h('label', { text: 'Messages' }),
+            h('b', { text: s.dcs.rate.toLocaleString() }), h('small', { text: '/ min' }),
+            s.dcs.last ? h('div', {}, agoEl(s.dcs.last)) : null),
+          h('a', { class: 'kpi', href: '#/dcs', title: 'Open the DCS page' }, h('label', { text: 'Platforms heard' }),
+            h('b', { text: s.dcs.heard.toLocaleString() }), h('small', { text: 'this hour' })))));
     }
     if (s.satdump) {
       const keys = Object.keys(s.satdump);
@@ -1114,8 +1134,251 @@ function TextView(root, typeId, focusId) {
 
 const root = $('#view');
 
+// ------------------------------------------------------------------ DCS
+// Data Collection System: messages relayed from river gauges, weather stations, buoys and the like.
+// SatDump writes them only with "Parse DCS" on; without DCS files there is no DCS page.
+
+const DCS_SATS = { 1: 'GOES-East', 2: 'GOES-West' };
+const dcsType = ty => ty === 'Unknown' ? 'binary' : ty;
+
+/** A line through [x, y] points, drawn to fill its box; the newest point is marked. */
+function trend(points) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const sx = x => x1 > x0 ? (x - x0) / (x1 - x0) * 296 + 2 : 150;
+  const sy = y => y1 > y0 ? 41 - (y - y0) / (y1 - y0) * 38 : 22;
+  svg.setAttribute('viewBox', '0 0 300 44');
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.innerHTML = `<polyline points="${points.map(p => `${sx(p[0]).toFixed(1)},${sy(p[1]).toFixed(1)}`).join(' ')}"/>`;
+  return svg;
+}
+function minuteLine(values) {
+  return trend(values.map((v, i) => [i, v]).concat([[values.length, values[values.length - 1] || 0]]));
+}
+
+/** Each sensor's readings over time, from a platform's messages (newest first).
+ *  A message carries several readings per sensor: the newest was taken `age` minutes before it
+ *  was sent, and each one before that `interval` minutes earlier. */
+function dcsSeries(messages) {
+  const sensors = new Map();
+  for (const m of messages) {
+    for (const [name, interval, age, values] of m.v || []) {
+      let points = sensors.get(name);
+      if (!points) sensors.set(name, points = new Map());
+      values.forEach((raw, i) => {
+        const value = parseFloat(raw), t = Math.round((m.t - (age + i * interval) * 60) / 60) * 60;
+        if (isFinite(value) && !points.has(t)) points.set(t, value);  // the newest report of a reading wins
+      });
+    }
+  }
+  return [...sensors].map(([name, points]) => [name, [...points].sort((a, b) => a[0] - b[0])]);
+}
+
+function DcsView(root, initial) {
+  let q = '', kind = store.get('dcs:kind', ''), sort = store.get('dcs:sort', 'last');
+  let offset = 0, loading = false, done = false, run = 0, selected = null, ticks = 0, shownAll = false;
+  const head = h('div', { class: 'dcshead' });
+  const search = h('input', { type: 'search', placeholder: 'Find a platform: its address, or text in its latest message',
+    oninput: debounce(() => { q = search.value.trim(); reload(); }, 300) });
+  const sorter = h('select', { title: 'Order', onchange: () => { sort = sorter.value; store.set('dcs:sort', sort); reload(); } },
+    [['last', 'Latest heard'], ['count', 'Most messages'], ['strong', 'Strongest signal'], ['weak', 'Weakest signal'],
+      ['missed', 'Most missed slots'], ['address', 'Address']].map(([v, label]) => h('option', { value: v, text: label, selected: v === sort })));
+  const chips = h('div', { class: 'filters' });
+  const rows = h('div', { class: 'drows' });
+  const sentinel = h('div', { class: 'empty' });
+  const list = h('div', { class: 'pane scroll dlist' }, rows, sentinel);
+  const detail = h('div', { class: 'dcsdetail scroll' });
+  const el = h('div', { class: 'dcs' }, head, h('div', { class: 'dcsbody' },
+    h('div', { class: 'dcsleft' }, h('div', { class: 'dcsbar' }, search, sorter), chips, list), detail));
+  root.append(el);
+
+  function drawChips(count) {
+    const chip = (label, value) => h('button', { class: kind === value ? 'on' : '', text: label,
+      onclick: () => { kind = value; store.set('dcs:kind', value); reload(); } });
+    chips.replaceChildren(chip('All', ''), chip('With readings', 'values'), chip('Text', 'text'), chip('Binary', 'binary'),
+      chip('Flagged', 'flagged'), chip('Missed a slot', 'missed'), h('span', { class: 'spacer' }),
+      h('span', { class: 'dim', text: count == null ? '' : `${count.toLocaleString()} platform${count === 1 ? '' : 's'}` }));
+  }
+
+  const row = p => h('a', { class: 'drow' + (p.a === selected ? ' on' : ''), href: `#/dcs/${p.a}`, 'data-a': p.a },
+    h('span', { class: 'addr', text: p.a.toUpperCase() }),
+    h('span', { class: 'what', title: p.x || '' }, p.nm && h('b', { text: p.nm }),
+      h('span', { class: p.v ? 'vals' : 'raw', text: p.v || p.x || (p.n ? '' : 'never heard, only missed slots') })),
+    h('span', { class: 'ty' + (p.f & 255 ? ' warn' : ''), text: p.n ? dcsType(p.ty) : '' }),
+    h('span', { class: 'chn', text: `ch ${p.ch ?? '–'} · ${(DCS_SATS[p.sat] || '').replace('GOES-', '') || '?'}` }),
+    h('span', { class: 'sig', text: p.sig != null ? `${p.sig.toFixed(1)} dBm` : '' }),
+    p.t ? agoEl(p.t) : h('span', { class: 'dim', text: `${p.m} missed` }));
+
+  const query = (limit, from) => `/api/dcs/platforms?limit=${limit}&offset=${from}&sort=${sort}`
+    + (kind ? `&kind=${kind}` : '') + (q ? `&q=${encodeURIComponent(q)}` : '');
+
+  async function more() {
+    if (loading || done) return;
+    loading = true;
+    const mine = run;
+    let d;
+    try { d = await getJSON(query(100, offset)); } catch { d = null; }
+    if (mine !== run) return;
+    loading = false;
+    if (!d) { done = true; sentinel.textContent = 'DCS is not available.'; return; }
+    for (const p of d.items) rows.append(row(p));
+    offset += d.items.length;
+    done = !d.more;
+    drawChips(d.count);
+    sentinel.textContent = done ? (rows.children.length ? 'That is every platform.' : 'No platform matches.') : 'Loading…';
+    if (!done && sentinel.getBoundingClientRect().top < Math.min(list.getBoundingClientRect().bottom, innerHeight) + 400) more();
+  }
+  function reload() {
+    run++; offset = 0; loading = done = false;
+    rows.replaceChildren(); list.scrollTop = 0; sentinel.textContent = 'Loading…';
+    more();
+  }
+  /** Bring the top of the list up to date without disturbing someone who has scrolled into it. */
+  async function refresh() {
+    if (loading || list.scrollTop > 40) return;
+    const mine = run;
+    let d;
+    try { d = await getJSON(query(100, 0)); } catch { return; }
+    if (mine !== run || loading || list.scrollTop > 40) return;
+    rows.replaceChildren(...d.items.map(row));
+    offset = d.items.length; done = !d.more;
+    drawChips(d.count);
+    sentinel.textContent = done ? (rows.children.length ? 'That is every platform.' : 'No platform matches.') : 'Loading…';
+  }
+  list.addEventListener('scroll', () => {
+    if (sentinel.getBoundingClientRect().top < Math.min(list.getBoundingClientRect().bottom, innerHeight) + 400) more();
+  }, { passive: true });
+
+  async function drawHead() {
+    let s;
+    try { s = await getJSON('/api/dcs/summary'); } catch { s = null; }
+    if (!s || !s.store.files) {
+      head.replaceChildren(h('div', { class: 'empty', text: s ? 'No DCS files yet. They appear here once SatDump writes them.'
+        : 'No DCS data. Turn on "Parse DCS" in SatDump and this page fills in by itself.' }));
+      return;
+    }
+    const hr = s.hour, pct = (a, b) => b ? `${Math.round(100 * a / b)}%` : '–';
+    const decoded = hr.types.filter(([ty]) => ty === 'SHEF').reduce((a, [, n]) => a + n, 0);
+    const tile = (label, big, small, ...rest) => h('div', { class: 'kpi still' }, h('label', { text: label }),
+      h('b', { text: big }), small && h('small', { text: small }), rest);
+    const busiest = Math.max(1, ...hr.channels.map(c => c[1]));
+    const behind = s.store.pending > 50;
+    head.replaceChildren(
+      h('div', { class: 'kpis' },
+        tile('Messages', s.rate.toLocaleString(), '/ min', minuteLine(s.minutes),
+          h('span', { class: 'dim', text: `${hr.n.toLocaleString()} in the last hour` })),
+        tile('Platforms heard', s.heard.hour.toLocaleString(), 'this hour',
+          h('div', { class: 'dim', text: `${s.heard.day.toLocaleString()} in the last day` }),
+          h('div', { class: 'dim', text: `${s.heard.ever.toLocaleString()} since ${utc(s.first, true)}` })),
+        tile('Relayed through', pct(hr.east, hr.n), 'East',
+          h('div', { class: 'split', title: `GOES-East ${hr.east.toLocaleString()}, GOES-West ${hr.west.toLocaleString()} in the last hour` },
+            h('i', { style: `flex:${hr.east}` }), h('i', { style: `flex:${hr.west}` })),
+          h('div', { class: 'dim', text: `${pct(hr.west, hr.n)} West` })),
+        tile('Decoded readings', pct(decoded, hr.n), 'of messages',
+          h('div', { class: 'dim', text: hr.types.map(([ty, n]) => `${dcsType(ty)} ${pct(n, hr.n)}`).join(' · ') })),
+        tile('Problems', hr.bad.toLocaleString(), 'flagged',
+          h('div', { class: hr.bad / Math.max(1, hr.n) > 0.02 ? 'note' : 'dim', text: `${pct(hr.bad, hr.n)} of messages in the last hour` }),
+          h('div', { class: 'dim', text: `${hr.missed.toLocaleString()} missed slots reported` }))),
+      h('div', { class: 'chanline' },
+        h('span', { class: 'dim', text: `${hr.channels.length} channels active in the last hour` }),
+        h('div', { class: 'chans' }, hr.channels.map(([ch, n]) =>
+          h('i', { title: `Channel ${ch}: ${n.toLocaleString()} messages in the last hour`, style: `opacity:${(0.25 + 0.75 * n / busiest).toFixed(2)}` }))),
+        h('span', { class: 'spacer' }),
+        h('span', { class: behind ? 'note' : 'dim', title: 'GOESview keeps every message this far back in its own database, for the history and charts of each platform.',
+          text: `${(s.store.history / 86400).toFixed(s.store.history % 86400 ? 1 : 0)}-day history, ${(s.store.size / 2 ** 20).toFixed(0)} MB`
+            + (behind ? ` · catching up, ${s.store.pending.toLocaleString()} files to read` : '') }),
+        s.last && h('span', { class: 'dim' }, ' · newest ', agoEl(s.last))));
+  }
+
+  function drawDetail(d) {
+    const series = dcsSeries(d.messages), asc = [...d.messages].reverse();
+    const span = d.messages.length > 1 ? (d.messages[0].t - d.messages[d.messages.length - 1].t) / 3600 : 0;
+    const flagNames = f => d.flags.filter((_, bit) => f >> bit & 1).map(name => name.replace(/_/g, ' '));
+    const card = (label, points, unit) => {
+      const ys = points.map(p => p[1]), latest = ys[ys.length - 1], lo = Math.min(...ys), hi = Math.max(...ys);
+      return h('div', { class: 'card', title: label }, h('label', { text: label }),
+        h('b', { text: `${+latest.toFixed(2)}${unit || ''}` }),
+        points.length > 1 && h('small', { text: lo === hi ? 'steady' : `${+lo.toFixed(2)} to ${+hi.toFixed(2)}` }),
+        points.length > 1 && trend(points),
+        h('div', { class: 'dim' }, `${points.length} reading${points.length === 1 ? '' : 's'}, newest `, agoEl(points[points.length - 1][0])));
+    };
+    const radio = (label, key, unit) => {
+      const points = asc.filter(m => m[key] != null).map(m => [m.t, m[key]]);
+      return points.length ? card(label, points, unit) : null;
+    };
+    const about = d.dcp && Object.entries(d.dcp).filter(([, v]) => v != null && typeof v !== 'object' && String(v).trim() !== '');
+    const message = m => h('div', { class: 'msg' },
+      h('header', {}, h('b', { text: utc(m.t, true) }), agoEl(m.t),
+        h('span', { class: 'dim', text: `${dcsType(m.ty)} · ch ${m.ch ?? '–'} · ${DCS_SATS[m.sat] || '?'}${m.sig != null ? ` · ${m.sig.toFixed(1)} dBm` : ''}` }),
+        m.f & 255 ? h('span', { class: 'note', text: flagNames(m.f & 255).join(', ') }) : null),
+      m.v && h('div', { class: 'vals' }, m.v.map(([name, , , values]) => h('span', {}, h('i', { text: name }), ` ${values.join('  ')}`))),
+      h('pre', { text: m.x || '(empty)' }));
+    const shown = shownAll ? d.messages : d.messages.slice(0, 20);
+    detail.replaceChildren(...[
+      h('a', { class: 'back', href: '#/dcs', text: '← All platforms' }),
+      h('h2', {}, h('span', { class: 'addr', text: d.a.toUpperCase() }), d.nm && ` ${d.nm}`),
+      h('div', { class: 'sub' },
+        d.n ? `Channel ${d.ch ?? '–'} · ${DCS_SATS[d.sat] || 'satellite unknown'}${d.rate ? ` · ${d.rate} baud` : ''} · heard ${d.n.toLocaleString()} time${d.n === 1 ? '' : 's'}, first ${utc(d.first, true)}, last `
+          : 'Never heard here. ', d.n ? agoEl(d.t) : null,
+        d.m ? h('div', { class: 'note' }, `${d.m.toLocaleString()} missed slot${d.m === 1 ? '' : 's'} reported, the latest `, agoEl(d.mt)) : null,
+        d.f & 255 ? h('div', { class: 'note', text: `Latest message flagged: ${flagNames(d.f & 255).join(', ')}` }) : null),
+      about && about.length ? h('div', { class: 'kv2' }, about.map(([k, v]) => [h('span', { text: k.replace(/_/g, ' ') }), h('span', { text: String(v) })])) : null,
+      series.length ? h('h3', { text: `Readings${span > 1 ? `, last ${span < 48 ? `${Math.round(span)} hours` : `${(span / 24).toFixed(1)} days`}` : ''}` }) : null,
+      series.length ? h('div', { class: 'cards' }, series.map(([name, points]) => card(name, points))) : null,
+      d.messages.length ? h('h3', { text: 'Radio' }) : null,
+      d.messages.length ? h('div', { class: 'cards' }, radio('Signal strength', 'sig', ' dBm'), radio('Phase noise', 'noise', '°'), radio('Frequency offset', 'off', ' Hz')) : null,
+      h('h3', { text: d.messages.length ? `Messages, newest first (${d.messages.length.toLocaleString()} in the ${(d.history / 86400).toFixed(d.history % 86400 ? 1 : 0)}-day history)` : 'No messages in the history kept' }),
+      shown.map(message),
+      shown.length < d.messages.length ? h('button', { class: 'more', text: `Show all ${d.messages.length.toLocaleString()}`,
+        onclick: () => { shownAll = true; drawDetail(d); } }) : null,
+    ].flat().filter(Boolean));
+  }
+
+  async function select(address, quiet) {
+    const changed = address !== selected;
+    selected = address;
+    if (changed) shownAll = false;
+    el.classList.toggle('has-sel', !!address);
+    for (const r of rows.children) r.classList.toggle('on', r.dataset.a === address);
+    if (!address) {
+      detail.replaceChildren(h('div', { class: 'empty', text: 'Pick a platform to see its messages, its readings over time and how well it is being received.' }));
+      return;
+    }
+    if (changed && !quiet) detail.replaceChildren(h('div', { class: 'empty', text: 'Loading…' }));
+    let d;
+    try { d = await getJSON(`/api/dcs/platform?a=${encodeURIComponent(address)}`); } catch { d = null; }
+    if (selected !== address) return;
+    if (!d) { detail.replaceChildren(h('a', { class: 'back', href: '#/dcs', text: '← All platforms' }), h('div', { class: 'empty', text: `No platform ${address.toUpperCase()} has been heard.` })); return; }
+    const at = detail.scrollTop;
+    drawDetail(d);
+    if (!changed) detail.scrollTop = at;
+  }
+
+  drawChips();
+  drawHead();
+  more();
+  select(initial || null);
+
+  return {
+    nav: 'dcs',
+    select,
+    onStats() {  // every ten seconds
+      ticks++;
+      drawHead();
+      refresh();
+      if (selected && ticks % 6 === 0) select(selected, true);
+    },
+  };
+}
+
 function route() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean).map(decodeURIComponent);
+  if (parts[0] === 'dcs' && state.view && state.view.nav === 'dcs') {  // picking a platform keeps the list where it is
+    popup.close();
+    state.view.select(parts[1] ? parts[1].toLowerCase() : null);
+    return;
+  }
   if (state.view && state.view.destroy) state.view.destroy();
   root.replaceChildren();
   popup.close();
@@ -1124,6 +1387,7 @@ function route() {
   if (page === 'imagery' || page === 'weather') state.view = SectionView(root, page, arg === 'latest' ? 'latest' : 'feed');
   else if (page === 'type') state.view = Viewer(root, arg, +extra || 0);
   else if (page === 'text') state.view = TextView(root, arg || null, +extra || 0);
+  else if (page === 'dcs') state.view = DcsView(root, arg ? arg.toLowerCase() : null);
   else state.view = LiveView(root);
   root.classList.toggle('flow', state.view.nav === 'live');  // the Live page stacks and scrolls as a whole in a narrow window
   for (const a of document.querySelectorAll('#nav a')) a.classList.toggle('on', a.dataset.nav === state.view.nav);
@@ -1161,12 +1425,15 @@ function connect() {
     if (state.view && state.view.onPruned) state.view.onPruned(cutoff, what);
     reloadTypes();
   });
-  es.addEventListener('stats', e => {
-    const s = state.stats = JSON.parse(e.data);
-    const hour = Object.values(s.rate).flat().reduce((a, b) => a + b, 0);
-    $('#rate').textContent = `${hour} items in the last hour`;
-    if (state.view && state.view.onStats) state.view.onStats(s);
-  });
+  es.addEventListener('stats', e => applyStats(JSON.parse(e.data)));
+}
+
+function applyStats(s) {
+  state.stats = s;
+  const hour = Object.values(s.rate).flat().reduce((a, b) => a + b, 0);
+  $('#rate').textContent = `${hour} items in the last hour`;
+  $('#nav a[data-nav="dcs"]').hidden = !s.dcs;  // DCS shows only while SatDump is writing DCS files
+  if (state.view && state.view.onStats) state.view.onStats(s);
 }
 
 function fullscreen() {
@@ -1186,5 +1453,5 @@ $('#bar').addEventListener('click', e => {
 });
 document.addEventListener('keydown', e => { if (e.key === 'f' && !/INPUT|SELECT|TEXTAREA/.test(e.target.tagName) && !e.metaKey && !e.ctrlKey) fullscreen(); });
 
-loadTypes().then(() => { route(); connect(); addEventListener('hashchange', route); })
+loadTypes().then(() => { route(); connect(); addEventListener('hashchange', route); getJSON('/api/stats').then(applyStats).catch(() => {}); })
   .catch(err => root.append(h('div', { class: 'empty', text: `Cannot reach the server: ${err.message}` })));

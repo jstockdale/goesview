@@ -49,6 +49,8 @@ from datetime import timedelta
 from email.utils import formatdate, parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import dcs
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
 
@@ -1260,23 +1262,23 @@ class Pruner(threading.Thread):
     """Deletes the oldest files to stay within the cache limits and, separately and
     only if asked, the SatDump limits. Always oldest first."""
 
-    def __init__(self, app, cache, satdump, every, dry_run, protect=(), include=()):
+    def __init__(self, app, cache, satdump, every, dry_run, protect=(), include=(), dcs_limits=None):
         super().__init__(daemon=True, name="pruner")
         self.app, self.catalog = app, app.catalog
-        self.cache, self.satdump = cache, satdump
+        self.cache, self.satdump, self.dcs = cache, satdump, dcs_limits
         self.protect, self.include = set(protect), set(include)
         self.scope = None  # what SatDump retention applies to, for the log and the Live page
         if satdump:
             self.survey()
         self.every, self.dry_run = every, dry_run
-        self.last = {"cache": None, "satdump": None}
+        self.last = {"cache": None, "satdump": None, "dcs": None}
         self.cache_swept = 0
         self.cache_root = os.path.dirname(self.catalog.derived_root)
         os.makedirs(self.cache_root, exist_ok=True)
 
     def run(self):
         while True:
-            for sweep in (self.sweep_cache, self.sweep_satdump):
+            for sweep in (self.sweep_cache, self.sweep_satdump, self.sweep_dcs):
                 try:
                     sweep()
                 except Exception:
@@ -1550,6 +1552,35 @@ class Pruner(threading.Thread):
         catalog.publish("pruned", {"cutoff": int(doomed[-1][0]), "what": "satdump"})
 
 
+    # -- SatDump's DCS files: a policy of their own, only with an explicit --satdump-dcs-* limit
+
+    def sweep_dcs(self):
+        if not self.dcs:
+            return  # the default: SatDump's DCS files are never touched
+        root = self.catalog.root
+        units = dcs.retention_units(goes_runs(root, self.protect, self.include)[0])
+        if not units:
+            return
+        now = min(time.time(), units[-1][0])  # ages count back from the newest data, as for the rest
+        cut = self.choose(units, self.dcs, now, root, "SatDump DCS files")
+        if not cut:
+            return
+        doomed = units[:cut]
+        self.record("dcs", "SatDump DCS files",
+                    f"{count(len(doomed), 'DCS file')} dated up to "
+                    f"{time.strftime('%Y-%m-%d %H:%MZ', time.gmtime(doomed[-1][0]))}, "
+                    f"{human(sum(self.size(unit) for unit in doomed))}")
+        if self.dry_run:
+            return
+        for _, _, path, _ in doomed:
+            if not os.path.realpath(path).startswith(root + os.sep):
+                continue  # never touch anything outside the data folder
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 # ------------------------------------------------------------ bulletin archive
 
 class Archiver(threading.Thread):
@@ -1749,6 +1780,17 @@ class Handler(BaseHTTPRequestHandler):
             body = catalog.timeline(params.get("type", ""))
         elif name == "stats":
             body = self.app.stats()
+        elif name.startswith("dcs/") and self.app.dcs:
+            store = self.app.dcs
+            if name == "dcs/summary":
+                body = store.summary()
+            elif name == "dcs/platforms":
+                body = store.platforms(params.get("q"), params.get("kind"), params.get("sort"),
+                                       min(int(params.get("limit", 100)), 500), max(int(params.get("offset", 0)), 0))
+            elif name == "dcs/platform":
+                body = store.platform(params.get("a", ""))
+            else:
+                body = None
         else:
             body = None
         if body is None:
@@ -1883,6 +1925,8 @@ class App:
         self.colourist = None
         self.text_index = None
         self.archiver = None
+        self.dcs = None
+        self.dcs_archiver = None
 
     def stats(self):
         disk = shutil.disk_usage(self.catalog.root)
@@ -1892,9 +1936,18 @@ class App:
                    "satdump": pruner.satdump.describe() if pruner and pruner.satdump else None,
                    "scope": pruner.scope if pruner else None,
                    "archive": self.archiver.status() if self.archiver else None,
+                   # SatDump's DCS files have a policy of their own; None when nothing may delete or pack them
+                   "dcs": {"limits": pruner.dcs.describe() if pruner and pruner.dcs else None,
+                           "archive": self.dcs_archiver.status() if self.dcs_archiver else None},
                    "dry": bool(pruner and pruner.dry_run),
                    "last": pruner.last if pruner else {}}
-        return {**self.catalog.stats(), "storage": storage, **self.extra}
+        brief = None
+        if self.dcs:
+            try:
+                brief = self.dcs.brief()
+            except Exception:
+                traceback.print_exc()
+        return {**self.catalog.stats(), "storage": storage, "dcs": brief, **self.extra}
 
     def watch(self, interval):
         ticks = 0
@@ -1953,6 +2006,26 @@ def main():
                              "clusters. Today's bulletins are left as ordinary files")
     theirs.add_argument("--satdump-include", action="append", default=[], metavar="FOLDER",
                         help="also treat this folder as a GOES HRIT run, if you named it yourself; may be repeated")
+    dcs_group = ap.add_argument_group(
+        "DCS (Data Collection System)",
+        "When SatDump's \"Parse DCS\" is on, GOESview reads the DCS files it writes and shows them on a DCS page; "
+        "with no DCS files there is no DCS page. Reading never changes SatDump's files. The --satdump-dcs-* and "
+        "--archive-dcs options are separate from everything above: --satdump-keep and friends never touch DCS "
+        "files, and these never touch anything else. None has a default.")
+    dcs_group.add_argument("--dcs-history", type=parse_age, default=3 * 86400, metavar="AGE",
+                           help="how far back GOESview's own DCS database keeps every message, for a platform's "
+                                "history and charts; about 300 MB a day (default: 3d). This is GOESview's file, "
+                                "in the cache folder")
+    dcs_group.add_argument("--satdump-dcs-keep", type=parse_age, metavar="AGE",
+                           help="PERMANENTLY DELETE SatDump's DCS files older than this: 15d, 1mo")
+    dcs_group.add_argument("--satdump-dcs-max-size", type=parse_size, metavar="SIZE",
+                           help="keep SatDump's DCS files under this size, deleting the oldest: 20G")
+    dcs_group.add_argument("--archive-dcs", action="store_true",
+                           help="pack each finished day's DCS files into one zip inside the run folder "
+                                f"({dcs.DCS_ARCHIVE_DIR}/DAY.zip), verify it, then delete the loose files. A day is "
+                                "some 24,000 files; packed it takes about a ninth of the space. Today's files are "
+                                "left as they are")
+    dcs_group.add_argument("--no-dcs", action="store_true", help="do not read DCS files at all: no DCS page")
     ap.add_argument("--prune-every", type=float, default=10, metavar="MIN", help="minutes between retention sweeps (default: %(default)s)")
     ap.add_argument("--prune-dry-run", action="store_true", help="log what retention would delete, delete nothing")
     for old in ("--keep", "--max-size", "--min-free"):  # early names that did not say whose files they deleted
@@ -2014,9 +2087,14 @@ def main():
         log(f"retention, SatDump data: {satdump_limits.describe()}; OLDER DATA IS DELETED{dry}")
     else:
         log("retention, SatDump data: never deleted (no --satdump-* option given)")
-    if cache_limits or satdump_limits:
+    dcs_limits = Limits(args.satdump_dcs_keep, args.satdump_dcs_max_size)
+    if dcs_limits:
+        log(f"retention, SatDump DCS files: {dcs_limits.describe()}; OLDER DCS FILES ARE DELETED{dry}")
+    else:
+        log("retention, SatDump DCS files: never deleted (no --satdump-dcs-* option given)")
+    if cache_limits or satdump_limits or dcs_limits:
         app.pruner = Pruner(app, cache_limits, satdump_limits, args.prune_every * 60, args.prune_dry_run,
-                            args.satdump_protect, args.satdump_include)
+                            args.satdump_protect, args.satdump_include, dcs_limits)
         app.pruner.start()
 
     if args.archive_bulletins:
@@ -2025,6 +2103,23 @@ def main():
         log(f"bulletin archive: on{dry}; finished days are packed into <run>/{ARCHIVE_DIR}/DAY.zip and the loose files deleted")
     else:
         log("bulletin archive: off (see --archive-bulletins)")
+
+    if not args.no_dcs:
+        try:
+            os.makedirs(args.cache, exist_ok=True)
+            # reading is harmless, so protected runs are read too; packing and deleting honour --satdump-protect
+            app.dcs = dcs.DcsStore(args.cache, lambda: goes_runs(catalog.root, (), args.satdump_include)[0],
+                                   args.dcs_history, log)
+            app.dcs.start()
+        except Exception as exc:
+            log(f"DCS unavailable ({exc})")
+    if args.archive_dcs:
+        app.dcs_archiver = dcs.DcsArchiver(
+            lambda: goes_runs(catalog.root, args.satdump_protect, args.satdump_include)[0], args.prune_dry_run, log, on_disk)
+        app.dcs_archiver.start()
+        log(f"DCS archive: on{dry}; finished days are packed into <run>/{dcs.DCS_ARCHIVE_DIR}/DAY.zip and the loose files deleted")
+    else:
+        log("DCS archive: off (see --archive-dcs)")
 
     if args.satdump_api:
         threading.Thread(target=poll_satdump, args=(args.satdump_api, app.extra), daemon=True).start()

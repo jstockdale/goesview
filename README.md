@@ -15,6 +15,9 @@ weather products and text bulletins appear as they are received.
   follow new frames live.
 - **Text**: the EMWIN feed as it arrives, by product type or office, with
   full-text search across every bulletin.
+- **DCS**: when SatDump's "Parse DCS" is on, a page for the Data Collection
+  System: every platform heard, its latest message, its readings charted over
+  time and how well it is being received.
 - **False colour that survives split scans.** SatDump only builds its colour
   composite when band 2 and band 13 land in the same timestamp folder, and the
   HRIT feed regularly files one of them under the previous scan. goesview pairs
@@ -167,6 +170,55 @@ It is off by default, because it removes files SatDump wrote. It only works
 inside GOESview's idea of a GOES HRIT run folder (see Retention), honours
 `--satdump-protect`, touches nothing but EMWIN `.txt` bulletins, and with
 `--prune-dry-run` only reports what it would pack.
+
+## DCS
+
+GOES relays the Data Collection System: short messages from tens of thousands
+of river gauges, weather stations, tide gauges and buoys. With **Parse DCS**
+ticked in SatDump's GOES HRIT pipeline, SatDump writes them as JSON files into
+`<run folder>/DCS/`, one file every few seconds. GOESview notices and a **DCS**
+page appears; with no DCS files there is no DCS page, and nothing to set up.
+
+- **Summary**: messages a minute, platforms heard, the East/West split, how
+  many messages SatDump could decode, flagged messages and missed slots, and
+  which channels are busy.
+- **Platforms**: one row per platform, searchable by address or by the text of
+  its latest message, filtered to those with decoded readings, plain text,
+  undecoded binary, flagged messages or missed slots.
+- **One platform**: its readings (river stage, rainfall, battery and so on)
+  charted over the history kept, its signal strength, phase noise and
+  frequency offset, and every message it sent.
+
+About a third of messages arrive decoded into named readings; the rest are
+shown as received. Platform names and locations appear when SatDump supplies
+them, which needs NOAA's platform table; without it platforms are known by
+their address.
+
+DCS is about a million messages a day, so GOESview reads the files once into
+a database of its own, `dcs-1.sqlite3` in the cache folder. It keeps one row
+per platform for good and every message for `--dcs-history` (3 days by
+default, about 300 MB a day). That database is GOESview's own and can be
+deleted; it is rebuilt from whatever DCS files are still on disk.
+
+**SatDump's DCS files are large**: around 24,000 files and 2.5 GB a day.
+Reading them never changes them, and none of the `--satdump-*` options above
+touches them. They have two options of their own, both off unless given:
+
+| Option | Example | Meaning |
+|---|---|---|
+| `--archive-dcs` | | Pack each finished day's DCS files into `<run folder>/DCS-archive/DAY.zip`, verify the zip byte for byte, then remove the loose files. About a ninth of the space. |
+| `--satdump-dcs-keep AGE` | `15d` | **Permanently delete** SatDump's DCS files, loose or packed, older than this. |
+| `--satdump-dcs-max-size SIZE` | `20G` | Keep SatDump's DCS files under this size, deleting the oldest. |
+| `--dcs-history AGE` | `7d` | How far back GOESview's own database keeps every message. |
+| `--no-dcs` | | Do not read DCS files at all. |
+
+The archive works as it does for bulletins: today's files stay as they are, a
+day is packed an hour after it ends (UTC), and nothing is removed until the
+zip has been read back and compared. Only files with SatDump's DCS file names
+are ever packed or deleted, only inside GOES HRIT run folders, never in a
+folder named with `--satdump-protect`, and `--prune-dry-run` makes both report
+without acting. The Live page shows the DCS policy on its own line under
+Storage.
 
 ## Colour tables
 

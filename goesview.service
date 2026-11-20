@@ -19,6 +19,11 @@
 # text bulletins into one verified zip per day and remove the loose files.
 # Worth having on exFAT drives, where every small file takes a whole cluster.
 #
+# DCS: with "Parse DCS" on in SatDump, a DCS page appears by itself. SatDump's DCS
+# files are about 2.5 GB a day; to pack finished days into zips and delete old ones add
+#   --archive-dcs --satdump-dcs-keep 15d
+# These are separate from the --satdump-* options above and touch only DCS files.
+#
 # Install:
 #   sudo cp goesview.service /etc/systemd/system/
 #   sudo systemctl daemon-reload

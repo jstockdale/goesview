@@ -224,6 +224,68 @@ button.link:hover { text-decoration: underline; }
 .more { display: block; margin: 16px auto 0; }
 .empty { color: var(--dim); padding: 40px; text-align: center; }
 
+/* DCS */
+[hidden] { display: none !important; }
+.kpis.two { grid-template-columns: repeat(2, 1fr); margin-bottom: 0; }
+.kpi.still:hover { border-color: transparent; }
+.dcs { height: 100%; display: flex; flex-direction: column; min-height: 0; }
+.dcshead { padding: 10px 14px 4px; flex: none; }
+.dcshead .kpis { grid-template-columns: repeat(5, minmax(0, 1fr)); margin-bottom: 8px; }
+.dcshead .kpi svg, .card svg { display: block; width: 100%; height: 22px; margin: 3px 0 2px; }
+.dcshead .kpi > div, .dcshead .kpi > span { font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.split { display: flex; height: 6px; border-radius: 3px; overflow: hidden; background: var(--line); margin: 8px 0 5px; }
+.split i { display: block; background: var(--accent); }
+.split i + i { background: var(--good); }
+.chanline { display: flex; align-items: center; gap: 8px; font-size: 11px; min-width: 0; }
+.chanline .spacer { flex: 1; }
+.chanline > span { white-space: nowrap; }
+.chans { display: flex; flex-wrap: wrap; gap: 2px; min-width: 0; max-height: 20px; overflow: hidden; }
+.chans i { width: 5px; height: 9px; border-radius: 1px; background: var(--good); }
+.dcsbody { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); border-top: 1px solid var(--line); }
+.dcsleft { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--line); }
+.dcsbar { display: flex; gap: 8px; padding: 8px 14px 0; flex: none; }
+.dcsbar select { flex: none; }
+.dlist { padding: 8px 8px 30px; }
+.drow { display: grid; grid-template-columns: 9ch minmax(0, 1fr) 7ch 12ch 9ch 8ch; gap: 10px; align-items: baseline; padding: 5px 8px;
+  border-radius: 6px; font-size: 12px; white-space: nowrap; }
+.drow:hover { background: var(--raise); }
+.drow.on { background: var(--raise); box-shadow: inset 2px 0 var(--accent); border-radius: 0 6px 6px 0; }
+.addr { font-family: var(--mono); color: var(--accent); }
+.drow .what { overflow: hidden; text-overflow: ellipsis; }
+.drow .what b { margin-right: 8px; }
+.drow .raw { font-family: var(--mono); color: var(--dim); }
+.drow .ty, .drow .chn, .drow .sig, .drow .ago, .drow > .dim { color: var(--dim); font-variant-numeric: tabular-nums; text-align: right; }
+.drow .ty.warn { color: var(--warn); }
+.dcsdetail { padding: 12px 14px 30px; min-width: 0; }
+.dcsdetail .back { display: none; color: var(--accent); margin-bottom: 8px; }
+.dcsdetail h2 { margin: 0; font-size: 17px; }
+.dcsdetail .sub { color: var(--dim); font-size: 12px; margin: 3px 0 14px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; margin-bottom: 14px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; min-width: 0; font-size: 11px; }
+.card label { display: block; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card b { font-size: 18px; font-variant-numeric: tabular-nums; }
+.card small { color: var(--dim); margin-left: 6px; }
+.card svg { height: 40px; margin: 5px 0 3px; }
+.card polyline { fill: none; stroke: var(--accent); stroke-width: 1.4; vector-effect: non-scaling-stroke; }
+.kv2 { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; font-size: 12px; margin-bottom: 14px; }
+.kv2 span:nth-child(odd) { color: var(--dim); }
+.msg { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; overflow: hidden; background: var(--panel); }
+.msg header { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 5px 10px; background: var(--raise); font-size: 12px; align-items: baseline; }
+.msg .vals { display: flex; flex-direction: column; gap: 2px; padding: 7px 10px 0; font-size: 12px; font-variant-numeric: tabular-nums; }
+.msg .vals i { font-style: normal; color: var(--dim); }
+.msg pre { margin: 0; padding: 7px 10px; font: 12px/1.4 var(--mono); color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 150px; overflow: auto; }
+@media (max-width: 1100px) {
+  .dcshead .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .chans { display: none; }
+  .dcsbody { grid-template-columns: minmax(0, 1fr); }
+  .dcsdetail { display: none; }
+  .dcs.has-sel .dcsleft, .dcs.has-sel .dcshead { display: none; }
+  .dcs.has-sel .dcsdetail { display: block; }
+  .dcsdetail .back { display: inline-block; }
+  .drow { grid-template-columns: 9ch minmax(0, 1fr) 8ch; }
+  .drow .ty, .drow .chn, .drow .sig { display: none; }
+}
+
 /* timeline viewer */
 .viewer { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding: 8px 14px; border-bottom: 1px solid var(--line); }
