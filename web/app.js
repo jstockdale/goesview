@@ -1515,7 +1515,10 @@ function DcsView(root, initial) {
       series.length ? h('h3', { text: `Readings${span > 1 ? `, last ${span < 48 ? `${Math.round(span)} hours` : `${(span / 24).toFixed(1)} days`}` : ''}` }) : null,
       series.length && dcsInferred(d.ty) ? h('div', { class: 'sub' },
         `SatDump could not decode this platform's messages, so GOESview read the numbers from their shape (${d.ty.replace(' (inferred)', '').toLowerCase()}). `
-        + 'It cannot tell what each reading measures'
+        // Names like "Sensor 2" or "Column 3" mean nothing is known; otherwise the station's own list fitted.
+        + (series.some(([name]) => /^(Sensor|Column|Lines?|Last value)\b/.test(name))
+          ? 'It cannot tell what each reading measures'
+          : "The names are the station's own sensor list, matched to the readings in order; that fit is likely but not certain")
         + (d.ty.startsWith('Pseudobinary') ? ', and the values assume two decimal places, as that format usually has.' : '.')) : null,
       series.length ? h('div', { class: 'cards' }, series.map(([name, points]) => card(name, points))) : null,
       d.messages.length ? h('h3', { text: 'Radio' }) : null,
