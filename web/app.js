@@ -61,7 +61,7 @@ setInterval(() => {
 /** A tile showing one image item; clicking opens that type's timeline. */
 function tile(item, sizes) {
   const type = state.types.get(item.ty);
-  return h('a', { class: 'tile', href: typeHref(item.ty, item.t), 'data-ty': item.ty },
+  return h('a', { class: 'tile', href: typeHref(item.ty, item.t), 'data-ty': item.ty, 'data-id': item.id },
     h('img', { loading: 'lazy', alt: '', sizes: sizes || '260px', onerror: e => e.target.classList.add('broken'),
       srcset: `${preview(item.p, 320)} 320w, ${preview(item.p, 960)} 960w`, src: preview(item.p, 320) }),
     h('div', { class: 'cap' },
@@ -239,7 +239,7 @@ const popup = (() => {
           h('a', { class: 'btn go', href: isImage ? typeHref(item.ty, item.t) : textHref(item.ty, item.id) },
             isImage ? 'Open in timeline →' : ['See it among ', h('span', { class: 'code', text: code || '···' }), ' bulletins →']),
           h('a', { class: 'btn', href: file(item.p), target: '_blank', rel: 'noopener', text: isImage ? 'Full resolution ↗' : 'Raw ↗' }),
-          h('button', { title: 'Close (Esc)', text: '✕', onclick: () => dlg.close() }))),
+          h('button', { class: 'shut', title: 'Close (Esc)', text: 'Close', onclick: () => dlg.close() }))),
       body);
     if (onShow) onShow(item);
   }
@@ -619,6 +619,10 @@ function LiveView(root) {
 // ------------------------------------------- section: groups, latest and feed
 
 
+// How many tiles an as-received list holds. A busy feed sends about 2,400 images a day to the Imagery
+// overview, so this is more than a day of it; a page left open for a week stays this size.
+const SECTION_KEEP = 3000;
+
 function SectionView(root, section, mode) {
   const side = sidebar(section);
   const tabs = h('div', { class: 'tabs' });
@@ -627,7 +631,7 @@ function SectionView(root, section, mode) {
   root.append(h('div', { class: 'section' }, side, h('div', { class: 'content' }, tabs, filters, pane)));
 
   let onlyGroup = store.get(`group:${section}`, ''), show = store.get(`show:${section}`, 'all');
-  let before = 0, loading = false, done = false, run = 0;
+  let before = 0, loading = false, done = false, run = 0, allowance = SECTION_KEEP;
   const grid = h('div', { class: 'grid' });
   const sentinel = h('div', { class: 'empty' });
   const watcher = new IntersectionObserver(es => es[0].isIntersecting && more(), { root: pane, rootMargin: '600px' });
@@ -663,19 +667,30 @@ function SectionView(root, section, mode) {
     ].filter(Boolean));
   }
 
-  const place = item => { const el = tile(item); grid.prepend(el); flash(el); };
+  /** A new arrival goes on top. Past SECTION_KEEP the oldest tiles are dropped from the far end, which
+   *  only happens while live, with the reader at the top; scrolling down fetches them again. */
+  function place(item) {
+    const el = tile(item); grid.prepend(el); flash(el);
+    if (grid.children.length <= SECTION_KEEP) return;
+    while (grid.children.length > SECTION_KEEP) grid.lastChild.remove();
+    before = +grid.lastChild.dataset.id;  // continue from the oldest tile still shown
+    run++; loading = done = false; allowance = SECTION_KEEP;  // a page being fetched now would leave a gap
+    sentinel.textContent = 'Loading…';
+  }
 
   /** Back to live: add what arrived meanwhile, and leave what is already on the page
    *  (older items scrolled into included) as it is. */
   function catchUp() {
-    for (const item of waiting.splice(0)) place(item);
+    const items = waiting.splice(0);
+    if (items.length >= SECTION_KEEP) return redraw();  // paused so long the oldest arrivals were let go
+    for (const item of items) place(item);
   }
 
   function redraw() {
     live.reset();
     waiting.length = 0;
     drawBars();
-    run++; before = 0; done = loading = false;
+    run++; before = 0; done = loading = false; allowance = SECTION_KEEP;
     watcher.unobserve(sentinel);
     pane.replaceChildren();
     if (mode === 'latest') drawLatest();
@@ -700,6 +715,13 @@ function SectionView(root, section, mode) {
 
   async function more() {
     if (loading || done) return;
+    if (grid.children.length >= allowance) {  // a lot is loaded: going further back is the reader's call
+      sentinel.replaceChildren(`${grid.children.length.toLocaleString()} shown.`,
+        h('button', { class: 'more', text: 'Show older', onclick: () => {
+          allowance = grid.children.length + SECTION_KEEP; sentinel.textContent = 'Loading…'; more();
+        } }));
+      return;
+    }
     loading = true;
     const mine = run;
     const d = await getJSON(`/api/items?sec=${section}&kind=i&limit=48${before ? `&before=${before}` : ''}`
@@ -727,6 +749,7 @@ function SectionView(root, section, mode) {
         const el = tile(type.last); old.replaceWith(el); flash(el);
       } else if (!live.live) {
         waiting.push(item);  // paused: count it, move nothing
+        if (waiting.length > SECTION_KEEP) waiting.shift();
         live.missed();
       } else place(item);
     },
@@ -1015,7 +1038,7 @@ function TextView(root, typeId, focusId) {
     const marked = item.hit && item.hit.includes('\x02');
     const excerpt = marked && h('div', { class: 'excerpt' },
       item.hit.split(/\x02(.*?)\x03/s).map((part, i) => i % 2 ? h('mark', { text: part }) : part.replace(/\s+/g, ' ')));
-    const el = h('article', { class: 'bulletin' },
+    const el = h('article', { class: 'bulletin', 'data-id': item.id },
       h('header', {},
         h('span', { class: 'code' + (WARN_CODES.has(code) ? ' warn' : ''), text: code }),
         h('b', { text: item.nm || (type && type.label) || '' }),
@@ -1076,7 +1099,11 @@ function TextView(root, typeId, focusId) {
       const el = card(item), reading = pane.scrollTop > 60;
       feed.prepend(el);
       if (reading) pane.scrollTop += el.offsetHeight + 10; else flash(el);  // do not shove text someone is reading
-      while (!reading && feed.children.length > 400) feed.lastChild.remove();
+      if (!reading && !loading && feed.children.length > 400) {
+        while (feed.children.length > 400) feed.lastChild.remove();
+        before = +feed.lastChild.dataset.id; done = false;  // scrolling down continues from the oldest one still shown
+        sentinel.textContent = 'Loading…';
+      }
     },
     onTypes: refreshSide,
     destroy() { watcher.disconnect(); },

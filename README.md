@@ -210,4 +210,8 @@ Written against SatDump 1.2 output from GOES-18 HRIT (which also relays
 GOES-19 and Himawari imagery). Other GOES satellites should work unchanged;
 other SatDump pipelines will show up as generic image types.
 
+## Credits
+
+Made by [@jstockdale](https://github.com/jstockdale) and Off by One, Inc.
+
 BSD-3-Clause licensed. Not affiliated with SatDump, NOAA or usradioguy.com.
