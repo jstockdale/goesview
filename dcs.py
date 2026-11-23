@@ -31,6 +31,8 @@ import traceback
 import urllib.request
 import zipfile
 
+import watch
+
 DCS_DIR = "DCS"
 DCS_ARCHIVE_DIR = "DCS-archive"  # in a run folder: one zip of DCS files per finished day
 FILE_RE = re.compile(r"^pH-(\d{2})(\d{3})(\d{2})(\d{2})(\d{2})-\w+\.dcs\.json$", re.I)
@@ -446,12 +448,33 @@ def parse(raw, ftime):
     return rows, missed
 
 
-class DcsStore(threading.Thread):
-    """Reads SatDump's DCS files into the database and answers the DCS page's questions."""
+class Folder:
+    """What is known of one run's DCS folder between passes."""
 
-    def __init__(self, folder, runs, history, log, stations=None):
+    __slots__ = ("watched", "deaf", "mtime", "doubt", "unheard", "listed", "cost")
+
+    def __init__(self):
+        self.watched = False  # the system reports its new files, so it is not listed
+        self.deaf = False     # ... it was asked to and did not: back to listing, for good
+        self.mtime = None
+        self.doubt = 0        # passes in a row where the folder changed and the watch said nothing
+        self.unheard = 0      # listings in a row that found files the watch never mentioned
+        self.listed = 0.0     # when it was last listed, and how long that took
+        self.cost = 0.0
+
+
+class DcsStore(threading.Thread):
+    """Reads SatDump's DCS files into the database and answers the DCS page's questions.
+
+    A day is some 22,000 files in one flat folder, slow to list, so where the system can
+    report new files (watch.py) the folder is listed once and after that only to check."""
+
+    def __init__(self, folder, runs, history, log, stations=None, watcher=None):
         super().__init__(daemon=True, name="dcs")
         self.folder = folder
+        self.watcher = watcher
+        self.folders = {}  # a run's DCS folder -> Folder
+        self.waiting = {}  # run name -> {file name: (time, path)}: loose files not read yet
         self.stations_from = stations  # None, a file, or an address to fetch NOAA's platform table from
         self.stations, self.stations_stamp, self.stations_checked = {}, None, 0
         self.path = os.path.join(folder, "dcs-3.sqlite3")
@@ -572,18 +595,18 @@ class DcsStore(threading.Thread):
         now = time.time()
         floor = now - self.history
         todo = []
+        news, touched, lost = self.watcher.read() if self.watcher else ({}, (), False)
         for run in self.runs():
             key = os.path.basename(run.rstrip(os.sep)) or run
             seen = self.seen.get(key)
             if seen is None:
                 seen = self.seen[key] = {name for (name,) in db.execute("SELECT name FROM files WHERE run = ?", (key,))}
-            try:
-                for entry in os.scandir(os.path.join(run, DCS_DIR)):
-                    t = file_time(entry.name)
-                    if t is not None and t >= floor and entry.name not in seen:
-                        todo.append((t, key, entry.path, None, entry.name))
-            except OSError:
-                pass
+            folder = os.path.join(run, DCS_DIR)
+            waiting = self.waiting.setdefault(key, {})
+            self.discover(folder, waiting, seen, floor, news.get(folder, ()), folder in touched, lost, now)
+            for name in [name for name, (t, _) in waiting.items() if t < floor or name in seen]:
+                del waiting[name]
+            todo.extend((t, key, path, None, name) for name, (t, path) in waiting.items())
             try:  # days already packed away: only needed when the database is new or was behind
                 archives = list(os.scandir(os.path.join(run, DCS_ARCHIVE_DIR)))
             except OSError:
@@ -617,10 +640,14 @@ class DcsStore(threading.Thread):
                     break
                 try:
                     if member is None:
-                        if now - os.stat(path).st_mtime < 2:
-                            continue  # SatDump may still be writing it
-                        with open(path, "rb") as f:
-                            raw = f.read()
+                        try:
+                            if now - os.stat(path).st_mtime < 2:
+                                continue  # SatDump may still be writing it
+                            with open(path, "rb") as f:
+                                raw = f.read()
+                        except FileNotFoundError:  # packed into its day's archive, or pruned, before it was read
+                            self.waiting[key].pop(name, None)
+                            continue
                     else:
                         if path not in opened:
                             opened[path] = zipfile.ZipFile(path)
@@ -644,6 +671,86 @@ class DcsStore(threading.Thread):
             self.log("DCS: SatDump is writing DCS files; the DCS page is on")
         self.pending -= done
         return self.pending > 0 and done > 0
+
+    def discover(self, folder, waiting, seen, floor, names, touched, lost, now):
+        """Note the files in one run's DCS folder that have not been read yet, into `waiting`.
+
+        With a watch on the folder the names come from the system's report and the folder
+        is listed only when that cannot be trusted: after the system lost track, when the
+        folder changed and nothing was reported, and once an hour to be sure. Without one
+        it is listed whenever it has changed."""
+        state = self.folders.get(folder)
+        if state is None:
+            state = self.folders[folder] = Folder()
+
+        def note(name):
+            t = file_time(name)
+            if t is None or t < floor or name in seen or name in waiting:
+                return False
+            waiting[name] = (t, os.path.join(folder, name))
+            return True
+
+        def listing():
+            """List the folder. Returns how many unread files it held that we had not heard of."""
+            started = time.time()
+            try:
+                mtime = os.stat(folder).st_mtime_ns
+                found = [entry.name for entry in os.scandir(folder)]
+            except OSError:
+                return 0
+            state.listed = time.time()
+            state.cost, state.mtime = state.listed - started, mtime
+            if not state.watched and state.listed - mtime / 1e9 < 3:
+                # Changed a moment ago: a file added within the same tick of the folder's clock
+                # would leave its time as it is, so do not take "unchanged" on trust next pass.
+                state.mtime = None
+            present = set(found)
+            for name in [name for name in waiting if name not in present]:
+                del waiting[name]  # gone before it was read
+            return sum([note(name) for name in found])
+
+        if state.watched and not self.watcher.watching(folder):
+            state.watched, state.mtime = False, None  # the folder went away and came back
+        if not state.watched:
+            if self.watcher and not state.deaf and self.watcher.add(folder):
+                state.watched = True  # watch first, list second: nothing slips in between
+                listing()
+                return
+            try:
+                changed = os.stat(folder).st_mtime_ns != state.mtime
+            except OSError:
+                return
+            if changed:
+                listing()
+            return
+        for name in names:
+            note(name)
+        if lost:
+            listing()
+            return
+        try:
+            mtime = os.stat(folder).st_mtime_ns
+        except OSError:
+            return
+        if touched:
+            state.mtime, state.doubt, state.unheard = mtime, 0, 0
+        elif mtime == state.mtime:
+            state.doubt = 0
+        else:
+            # Changed, with nothing said. Once can be timing; twice running, list it and see.
+            state.doubt += 1
+            if state.doubt >= 2 and now - state.listed >= watch.budget(state.cost):
+                state.doubt = 0
+                if listing():
+                    state.unheard += 1
+                    if state.unheard >= 2:
+                        self.watcher.drop(folder)
+                        state.watched, state.deaf = False, True
+                        self.log(f"DCS: new files in {folder} are not being reported (a drive another "
+                                 f"machine writes to?): finding them by listing the folder instead")
+                        return
+        if now - state.listed > max(3600, watch.budget(state.cost, 0.003)):
+            listing()
 
     def store(self, db, ftime, key, name, rows, missed):
         cur = db.cursor()

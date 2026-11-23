@@ -51,6 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import dcs
 import monitor
+import watch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
@@ -243,19 +244,38 @@ class Type:
 
 
 class DirState:
-    __slots__ = ("mtime", "known", "pending")
+    __slots__ = ("mtime", "known", "pending", "watched", "deaf", "waiting", "doubt", "unheard", "listed", "cost")
 
     def __init__(self):
         self.mtime, self.known, self.pending = None, set(), False
+        self.watched = False   # the system reports this folder's new files, so it is not listed
+        self.deaf = False      # ... it was asked to and did not: back to listing, for good
+        self.waiting = set()   # names heard of that were still being written
+        self.doubt = 0         # polls in a row where the folder changed and the watch said nothing
+        self.unheard = 0       # listings in a row that found files the watch never mentioned
+        self.listed = 0.0      # when it was last listed, and how long that took
+        self.cost = 0.0
+
+
+# A folder this full is no longer listed to find what is new, where the system can report it.
+WATCH_FROM = 500
+# SatDump's DCS files have their own reader (dcs.py); the catalog has no use for these folders.
+NOT_CATALOGUED = (dcs.DCS_DIR, dcs.DCS_ARCHIVE_DIR)
 
 
 class Catalog:
-    """Everything received so far, kept current by polling directory mtimes."""
+    """Everything received so far, kept current by watching for new files.
 
-    def __init__(self, root, derived_root, settle=4.0):
+    Small folders are checked by modification time and listed when it moves. A big flat
+    folder (a day of bulletins is tens of thousands of files) is too slow to list every
+    few seconds, so the system is asked to report its new files instead (watch.py); where
+    it cannot, the folder is listed only as often as its size allows."""
+
+    def __init__(self, root, derived_root, settle=4.0, watcher=None, watch_from=WATCH_FROM):
         self.root = os.path.realpath(root)
         self.derived_root = os.path.realpath(derived_root)
         self.settle = settle
+        self.watcher, self.watch_from = watcher, watch_from
         self.lock = threading.RLock()
         self.items = []
         self.types = {}
@@ -390,9 +410,14 @@ class Catalog:
         """Look for new files. Old timestamp folders are checked only now and then."""
         self.tick += 1
         now = time.time()
+        news, touched, lost = self.watcher.read() if self.watcher else ({}, (), False)
         for path in list(self.dirs):
             state = self.dirs.get(path)
             if state is None:  # pruned since the loop began
+                continue
+            depth = path[len(self.root):].count(os.sep)
+            if state.watched:
+                self._hear(path, state, depth, news.get(path, ()), path in touched, lost, now)
                 continue
             if (self.tick % 40 and not state.pending and state.mtime
                     and now - state.mtime / 1e9 > 7200 and SLOT_RE.match(os.path.basename(path))):
@@ -402,31 +427,115 @@ class Catalog:
             except OSError:
                 continue
             if mtime != state.mtime or state.pending:
-                self._rescan(path, path[len(self.root):].count(os.sep), mtime)
+                if now - state.listed < watch.budget(state.cost):
+                    continue  # a big folder nothing reports on: list it only as often as its size allows
+                self._rescan(path, depth, mtime)
+
+    def _hear(self, path, state, depth, names, touched, lost, now):
+        """Take in what the system reported for a watched folder, without listing it.
+
+        The folder is still listed when the report cannot be trusted: after the system lost
+        track (too much at once), when the folder changed and nothing was reported (a drive
+        another machine writes to reports nothing), and once an hour to be sure."""
+        if not self.watcher.watching(path):  # the folder went away: back to checking it the plain way
+            state.watched, state.mtime = False, None
+            state.pending, state.waiting = state.pending or bool(state.waiting), set()
+            return
+        if lost:
+            self._rescan(path, depth)
+            return
+        for name in dict.fromkeys([*state.waiting, *names]):
+            if name in state.known:
+                continue
+            entry = watch.Named(path, name)
+            if self._take(state, entry, depth, now):
+                state.waiting.discard(name)
+            else:
+                state.waiting.add(name)  # still being written; look again next poll
+        try:
+            mtime = os.stat(path).st_mtime_ns
+        except OSError:
+            return
+        if touched:
+            state.mtime, state.doubt, state.unheard = mtime, 0, 0
+        elif mtime == state.mtime:
+            state.doubt = 0
+        else:
+            # Changed, with nothing said. Once can be timing (the report is a moment behind
+            # the change); twice running, the folder is listed to see what was missed.
+            state.doubt += 1
+            if state.doubt >= 2 and now - state.listed >= watch.budget(state.cost):
+                state.doubt = 0
+                if self._rescan(path, depth, mtime):
+                    state.unheard += 1
+                    if state.unheard >= 2:
+                        self._unwatch(path, state)
+                        return
+        if now - state.listed > max(3600, watch.budget(state.cost, 0.003)):
+            self._rescan(path, depth)
+
+    def _unwatch(self, path, state):
+        self.watcher.drop(path)
+        state.watched, state.deaf = False, True
+        state.pending, state.waiting = state.pending or bool(state.waiting), set()
+        log(f"catalog: new files in {os.path.relpath(path, self.root)} are not being reported "
+            f"(a drive another machine writes to?): finding them by listing the folder instead")
+
+    def _take(self, state, entry, depth, now):
+        """One new name in a folder. True once it has been dealt with for good."""
+        name = entry.name
+        if entry.is_dir(follow_symlinks=False):
+            state.known.add(name)
+            if (not name.startswith(".") and depth < 8 and entry.path != self.derived_root
+                    and not (name in NOT_CATALOGUED and self._outside_anchors(entry.path))):
+                self._rescan(entry.path, depth + 1)
+            return True
+        if self._consider(entry, now):
+            state.known.add(name)
+            return True
+        return False
+
+    def _outside_anchors(self, path):
+        return not any(part in ANCHORS for part in os.path.relpath(path, self.root).split(os.sep))
 
     def _rescan(self, path, depth, mtime=None):
+        """List a folder and take in what is new. Returns how many names were news to us:
+        neither known nor already heard of."""
         try:
             if mtime is None:
                 mtime = os.stat(path).st_mtime_ns
+            started = time.time()
             entries = list(os.scandir(path))
+            state = self.dirs.setdefault(path, DirState())
+            if (self.watcher and not state.watched and not state.deaf
+                    and len(entries) >= self.watch_from and self.watcher.add(path)):
+                state.watched = True
+                log(f"catalog: {os.path.relpath(path, self.root)} holds {len(entries):,} files: "
+                    f"hearing of new ones from the system from now on, not listing it")
+                # Once more, now that nothing can slip in between the listing and the watch.
+                mtime = os.stat(path).st_mtime_ns
+                started = time.time()
+                entries = list(os.scandir(path))
         except OSError:
-            return
-        state = self.dirs.setdefault(path, DirState())
+            return 0
+        state.listed = time.time()
+        state.cost = state.listed - started
         state.pending = False
         now = time.time()
+        fresh = 0
         for entry in entries:
             name = entry.name
             if name in state.known:
                 continue
-            if entry.is_dir(follow_symlinks=False):
-                state.known.add(name)
-                if not name.startswith(".") and depth < 8 and entry.path != self.derived_root:
-                    self._rescan(entry.path, depth + 1)
-            elif self._consider(entry, now):
-                state.known.add(name)
+            fresh += name not in state.waiting
+            if self._take(state, entry, depth, now):
+                state.waiting.discard(name)
+            elif state.watched:
+                state.waiting.add(name)  # still being written; look again next poll
             else:
-                state.pending = True  # still being written; look again next poll
+                state.pending = True     # likewise, by listing again
         state.mtime = mtime
+        return fresh
 
     def _consider(self, entry, now):
         if DAY_ZIP_RE.match(entry.name) and os.path.basename(os.path.dirname(entry.path)) == ARCHIVE_DIR:
@@ -608,7 +717,9 @@ class Catalog:
             # let the scanner notice if SatDump ever writes these names again
             for rel in list(dead_dirs) + [v[2:] for v in dead_files]:
                 full = os.path.join(self.root, *rel.split("/"))
-                self.dirs.pop(full, None)
+                state = self.dirs.pop(full, None)
+                if state is not None and state.watched:
+                    self.watcher.drop(full)
                 parent = self.dirs.get(os.path.dirname(full))
                 if parent:
                     parent.known.discard(os.path.basename(full))
@@ -1997,6 +2108,9 @@ def main():
     ap.add_argument("--warm-hours", type=float, default=24, help="pre-render previews for images this recent (default: %(default)s)")
     ap.add_argument("--workers", type=int, default=2, help="concurrent preview renders (default: %(default)s)")
     ap.add_argument("--interval", type=float, default=3, help="seconds between folder checks (default: %(default)s)")
+    ap.add_argument("--no-watch", action="store_true",
+                    help="find new files only by listing folders, never by asking the system to report them "
+                         "(Linux does that for big folders, which saves listing them every few seconds)")
     ours = ap.add_argument_group(
         "GOESview's own files",
         "The cache of previews and false-colour frames under --cache. Safe to delete: they are rebuilt "
@@ -2079,7 +2193,7 @@ def main():
     except OSError as exc:
         sys.exit(f"Cannot listen on {args.host}:{args.port}: {exc}")
     server.daemon_threads = True
-    catalog = Catalog(args.root, os.path.join(args.cache, "derived"))
+    catalog = Catalog(args.root, os.path.join(args.cache, "derived"), watcher=None if args.no_watch else watch.start())
     previews = Previews(catalog, os.path.join(args.cache, "previews"), args.workers)
     catalog.listeners.append(previews.enqueue)
     app = App(catalog, previews, None, args.verbose)
@@ -2142,7 +2256,8 @@ def main():
             # reading is harmless, so protected runs are read too; packing and deleting honour --satdump-protect
             stations = {"off": None, "none": None, "noaa": dcs.PDT_URL}.get(args.dcs_stations.lower(), args.dcs_stations)
             app.dcs = dcs.DcsStore(args.cache, lambda: goes_runs(catalog.root, (), args.satdump_include)[0],
-                                   args.dcs_history, log, stations)
+                                   args.dcs_history, log, stations,
+                                   watcher=None if args.no_watch else watch.start())
             log(f"DCS platform table: {stations or 'off (see --dcs-stations)'}")
             app.dcs.start()
         except Exception as exc:

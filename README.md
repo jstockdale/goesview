@@ -69,8 +69,20 @@ previews for the last 24; on a small machine shorten that with
 | `--workers` | 2 | Concurrent preview renders. |
 | `--satdump-api` | off | URL of SatDump's own HTTP stats, to show signal numbers on the Live page. |
 | `--no-text-index` | | Skip the full-text search index for the Text page. |
+| `--no-watch` | | Find new files only by listing folders (see below). |
 
 `--help` lists everything.
+
+SatDump puts a day's bulletins, and a day's DCS files, in one folder each:
+tens of thousands of files by evening. Listing such a folder every few seconds
+to find what is new is slow, on exFAT drives especially, so on Linux goesview
+lists a big folder once and after that has the system report each new file
+(inotify). It still lists the folder when a report cannot be trusted: if the
+folder changed and nothing was reported, as on a network drive that another
+machine writes to, it goes back to listing for that folder. Where there is
+nothing to report new files (other systems, or with `--no-watch`) a big
+folder is listed only as often as its size allows, at most about 5% of one
+processor, so new files in it can appear some seconds later.
 
 The Text page's search box looks through the full text of every bulletin as
 well as product and office codes: every word must appear, and a phrase in
@@ -358,7 +370,8 @@ temporary directory and checks, among other things, the promises that matter
 most: that nothing SatDump wrote is deleted unless a `--satdump-*` option
 asks for it, that retention and the archives never reach beyond GOES HRIT
 run folders or SatDump's own file names, that an archive is verified before
-anything is removed, and that the DCS decoders read what they claim to. The
+anything is removed, that the DCS decoders read what they claim to, and that
+new files are found without listing big folders over and over. The
 same suite runs on GitHub for every push, on Python 3.11 and 3.13, with and
 without numpy and Pillow.
 
