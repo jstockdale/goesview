@@ -6,7 +6,9 @@ no DCS, while the signal display carries on as if nothing were wrong. This
 folder has the fix, a script that installs it, and a workaround for when you
 cannot rebuild SatDump.
 
-Until a SatDump release includes the fix, this is how to get it.
+The fix has been proposed to SatDump as
+[SatDump/SatDump#1252](https://github.com/SatDump/SatDump/pull/1252). Until a
+SatDump release includes it, this is how to get it.
 
 ## Is this my problem?
 
