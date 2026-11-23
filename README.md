@@ -243,13 +243,13 @@ with units. Other formats are shown as received.
 
 **If SatDump stops writing files soon after you turn Parse DCS on**, look in
 its log for `Loading PDTs...` followed by `Error loading PDT line for DCP
-processing: stoul`. SatDump 1.2.3 deadlocks there when
-`~/.config/satdump/PDTS_COMPRESSED.txt` is not a real platform table, and
-since NOAA moved that file its old address returns a "Document Moved" page.
-Quit SatDump, delete that file, set `update_interval` to `-1` under
-`plugin_settings` → `goes_support` in `~/.config/satdump/settings.json` so it
-is not fetched again, and start SatDump. The HADS table alone covers about
-18,000 stations.
+processing: stoul`. SatDump built from source since January 2025 (1.2.3 and
+2.0) deadlocks there when `~/.config/satdump/PDTS_COMPRESSED.txt` is not a
+real platform table, and since NOAA moved that file its old address returns a
+"Document Moved" page. [`satdump-patch/`](satdump-patch/README.md) has the
+fix: a script that patches SatDump, rebuilds the one plugin and installs it
+(`./satdump-patch/fix-satdump-dcs.sh ~/SatDump`), the patches themselves, and
+a workaround for when you cannot rebuild SatDump.
 
 DCS is about a million messages a day, so GOESview reads the files once into
 a database of its own, `dcs-3.sqlite3` in the cache folder. It keeps one row
